@@ -345,6 +345,7 @@ pub fn update(
     let mut name = db_dir.file_name().unwrap_or_default().to_os_string();
     name.push(".new");
     let new_dir = db_dir.with_file_name(name);
+    crate::signatures::ensure_replaceable(&new_dir).context("db.new antigo")?;
     if new_dir.exists() {
         std::fs::remove_dir_all(&new_dir).context("removendo db.new antigo")?;
     }
@@ -491,6 +492,24 @@ mod tests {
         assert!(update(&db, &f, Some("k".into())).is_err());
         assert_eq!(std::fs::read(db.join("canary.txt")).unwrap(), b"keep");
         assert!(!tmp.path().join("Docs.old").exists());
+    }
+
+    #[test]
+    fn update_refuses_foreign_new_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db");
+        let foreign_new = tmp.path().join("db.new");
+        std::fs::create_dir_all(&foreign_new).unwrap();
+        std::fs::write(foreign_new.join("canary.txt"), "keep").unwrap();
+        let f = fake(
+            two_hashes(),
+            Resp::Ok(zip_of(&[("packages/core/rules.yar", GOOD)])),
+        );
+        assert!(update(&db, &f, Some("k".into())).is_err());
+        assert_eq!(
+            std::fs::read(foreign_new.join("canary.txt")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]

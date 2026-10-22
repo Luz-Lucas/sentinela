@@ -186,6 +186,7 @@ pub fn swap_in(db_dir: &Path, new_dir: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
     ensure_replaceable(db_dir)?;
     let old_dir = sibling_with_suffix(db_dir, ".old");
+    ensure_replaceable(&old_dir)?;
     if old_dir.exists() {
         std::fs::remove_dir_all(&old_dir)
             .with_context(|| format!("removing stale {}", old_dir.display()))?;
@@ -314,6 +315,21 @@ mod tests {
         assert!(!db.join("old.txt").exists());
         assert!(!new.exists());
         assert!(!tmp.path().join("db.old").exists());
+    }
+
+    #[test]
+    fn swap_in_refuses_foreign_old_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db");
+        let new = tmp.path().join("db.new");
+        let foreign_old = tmp.path().join("db.old");
+        fs::create_dir_all(&db).unwrap();
+        fs::write(db.join("hashes.txt"), "").unwrap();
+        fs::create_dir_all(&foreign_old).unwrap();
+        fs::write(foreign_old.join("canary.txt"), "keep").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        assert!(swap_in(&db, &new).is_err());
+        assert!(foreign_old.join("canary.txt").exists());
     }
 
     #[test]
