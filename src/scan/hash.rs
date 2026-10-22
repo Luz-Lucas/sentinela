@@ -40,8 +40,8 @@ impl Detector for HashDetector {
     fn name(&self) -> &'static str {
         "hash"
     }
-    fn inspect(&self, file: &FileData) -> Vec<Finding> {
-        if self.set.contains(&file.sha256) {
+    fn inspect(&self, file: &FileData) -> Result<Vec<Finding>, String> {
+        Ok(if self.set.contains(&file.sha256) {
             vec![Finding {
                 detector: "hash",
                 rule: format!("sha256:{}", hex::encode(file.sha256)),
@@ -50,7 +50,7 @@ impl Detector for HashDetector {
             }]
         } else {
             Vec::new()
-        }
+        })
     }
 }
 
@@ -84,7 +84,7 @@ mod tests {
             bytes: Some(b"abc"),
             sha256: h,
         };
-        let out = det.inspect(&f);
+        let out = det.inspect(&f).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Severity::Malicious);
         assert_eq!(out[0].detector, "hash");
@@ -100,7 +100,7 @@ mod tests {
             bytes: Some(b"abc"),
             sha256: h,
         };
-        assert!(det.inspect(&f).is_empty());
+        assert!(det.inspect(&f).unwrap().is_empty());
     }
 
     #[test]
@@ -112,6 +112,6 @@ mod tests {
             bytes: None,
             sha256: h,
         };
-        assert_eq!(det.inspect(&f).len(), 1);
+        assert_eq!(det.inspect(&f).unwrap().len(), 1);
     }
 }

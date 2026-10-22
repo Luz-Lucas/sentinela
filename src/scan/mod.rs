@@ -90,7 +90,7 @@ fn scan_entry(
     engine: &Engine,
     entry: &Entry,
     max_size: u64,
-) -> Result<(Severity, Vec<Finding>), WalkError> {
+) -> Result<(Severity, Vec<Finding>, Vec<WalkError>), WalkError> {
     let path = entry.path.as_path();
     // Big full reads are serialized to bound peak memory.
     let _guard = (entry.size > BIG_FILE && entry.size <= max_size)
@@ -105,15 +105,19 @@ fn scan_entry(
     } else {
         None
     };
+    let mut inspect_errors = Vec::new();
     let mut findings = if let Some(bytes) = full {
         let data = FileData {
             path,
             sha256: hash::sha256_bytes(&bytes),
             bytes: Some(&bytes),
         };
-        let mut f = engine.hash.inspect(&data);
+        let mut f = engine.hash.inspect(&data).unwrap_or_default();
         for d in &engine.content {
-            f.extend(d.inspect(&data));
+            match d.inspect(&data) {
+                Ok(found) => f.extend(found),
+                Err(e) => inspect_errors.push(walk_error(path, format!("{}: {e}", d.name()))),
+            }
         }
         f
     } else {
@@ -122,7 +126,7 @@ fn scan_entry(
             bytes: None,
             sha256: hash::sha256_file(path).map_err(|e| walk_error(path, e))?,
         };
-        engine.hash.inspect(&data)
+        engine.hash.inspect(&data).unwrap_or_default()
     };
     findings.sort_by_key(|a| std::cmp::Reverse(a.severity));
     let verdict = findings
@@ -130,7 +134,7 @@ fn scan_entry(
         .map(|f| f.severity)
         .max()
         .unwrap_or(Severity::Info);
-    Ok((verdict, findings))
+    Ok((verdict, findings, inspect_errors))
 }
 
 pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> ScanReport {
@@ -149,7 +153,8 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
     }
 
     let skipped = AtomicBool::new(skipped_in_walk);
-    let results: Vec<Result<Option<ScanItem>, WalkError>> = entries
+    type Scanned = (Option<ScanItem>, Vec<WalkError>);
+    let results: Vec<Result<Scanned, WalkError>> = entries
         .par_iter()
         .filter_map(|entry| {
             if cancel.load(Ordering::Relaxed) {
@@ -157,12 +162,13 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
                 return None;
             }
             Some(
-                scan_entry(engine, entry, opts.max_size).map(|(verdict, findings)| {
-                    (verdict >= Severity::Suspicious).then(|| ScanItem {
+                scan_entry(engine, entry, opts.max_size).map(|(verdict, findings, errs)| {
+                    let item = (verdict >= Severity::Suspicious).then(|| ScanItem {
                         path: entry.path.clone(),
                         verdict,
                         findings,
-                    })
+                    });
+                    (item, errs)
                 }),
             )
         })
@@ -172,9 +178,10 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
     let mut items = Vec::new();
     for r in results {
         match r {
-            Ok(item) => {
+            Ok((item, errs)) => {
                 scanned += 1;
                 items.extend(item);
+                errors.extend(errs);
             }
             Err(e) => errors.push(e),
         }
@@ -350,10 +357,33 @@ mod tests {
         fn name(&self) -> &'static str {
             "cancel"
         }
-        fn inspect(&self, _file: &FileData) -> Vec<Finding> {
+        fn inspect(&self, _file: &FileData) -> Result<Vec<Finding>, String> {
             self.0.store(true, Ordering::Relaxed);
-            Vec::new()
+            Ok(Vec::new())
         }
+    }
+
+    struct Failing;
+    impl Detector for Failing {
+        fn name(&self) -> &'static str {
+            "boom"
+        }
+        fn inspect(&self, _file: &FileData) -> Result<Vec<Finding>, String> {
+            Err("timeout".to_string())
+        }
+    }
+
+    #[test]
+    fn detector_error_becomes_scan_error_and_keeps_other_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("m.bin"), MARKER).unwrap();
+        let (mut engine, _) = Engine::from_database(&marker_db());
+        engine.content.insert(0, Box::new(Failing));
+        let report = run_scan(&engine, &opts(dir.path(), 1 << 20), &AtomicBool::new(false));
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].reason, "boom: timeout");
+        assert!(report.errors[0].path.ends_with("m.bin"));
     }
 
     #[test]

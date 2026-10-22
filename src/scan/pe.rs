@@ -117,11 +117,11 @@ impl Detector for PeDetector {
         "pe"
     }
 
-    fn inspect(&self, file: &FileData) -> Vec<Finding> {
+    fn inspect(&self, file: &FileData) -> Result<Vec<Finding>, String> {
         let Some(bytes) = file.bytes else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        match analyze(bytes) {
+        Ok(match analyze(bytes) {
             Some(r) if r.score >= SUSPICIOUS_THRESHOLD => vec![Finding {
                 detector: "pe",
                 rule: "pe-heuristics".to_string(),
@@ -129,7 +129,7 @@ impl Detector for PeDetector {
                 detail: r.signals.join("; "),
             }],
             _ => Vec::new(),
-        }
+        })
     }
 }
 
@@ -253,11 +253,13 @@ mod tests {
     }
 
     fn inspect(bytes: &[u8]) -> Vec<Finding> {
-        PeDetector.inspect(&FileData {
-            path: Path::new("x.exe"),
-            bytes: Some(bytes),
-            sha256: [0; 32],
-        })
+        PeDetector
+            .inspect(&FileData {
+                path: Path::new("x.exe"),
+                bytes: Some(bytes),
+                sha256: [0; 32],
+            })
+            .unwrap()
     }
 
     #[test]
@@ -366,11 +368,13 @@ mod tests {
 
     #[test]
     fn no_bytes_no_findings() {
-        let f = PeDetector.inspect(&FileData {
-            path: Path::new("x.exe"),
-            bytes: None,
-            sha256: [0; 32],
-        });
+        let f = PeDetector
+            .inspect(&FileData {
+                path: Path::new("x.exe"),
+                bytes: None,
+                sha256: [0; 32],
+            })
+            .unwrap();
         assert!(f.is_empty());
     }
 }

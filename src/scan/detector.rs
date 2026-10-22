@@ -27,5 +27,7 @@ pub struct FileData<'a> {
 
 pub trait Detector: Send + Sync {
     fn name(&self) -> &'static str;
-    fn inspect(&self, file: &FileData) -> Vec<Finding>;
+    /// `Err` reports that the file could not be inspected (e.g. scan timeout);
+    /// it is surfaced as a scan error instead of counting as clean.
+    fn inspect(&self, file: &FileData) -> Result<Vec<Finding>, String>;
 }
