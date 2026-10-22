@@ -32,6 +32,10 @@ pub struct WalkOptions {
     /// Treat ANY reparse point (not only symlinks/junctions) as a link. Used
     /// by the cleaner, which must never touch cloud placeholders or the like.
     pub strict_links: bool,
+    /// Report each entry's platform creation time. Callers that age files off
+    /// mtime alone (tests with backdated mtimes, which can't backdate
+    /// creation time too) leave this `false` to keep creation out of it.
+    pub use_creation_time: bool,
 }
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -59,19 +63,9 @@ pub fn classify_attrs(attrs: u32, is_symlink: bool, strict: bool) -> EntryClass 
     }
 }
 
-/// Creation time when the platform reports it. Unit tests report `None`
-/// because creation time cannot be backdated on Linux; the age rule itself is
-/// covered by the pure `effective_age` tests.
-pub(crate) fn created_of(meta: &Metadata) -> Option<SystemTime> {
-    #[cfg(test)]
-    {
-        let _ = meta;
-        None
-    }
-    #[cfg(not(test))]
-    {
-        meta.created().ok()
-    }
+/// Creation time when the platform reports it and the caller asked for it.
+pub(crate) fn created_of(meta: &Metadata, use_creation_time: bool) -> Option<SystemTime> {
+    use_creation_time.then(|| meta.created().ok()).flatten()
 }
 
 fn attrs_of(meta: &Metadata) -> u32 {
@@ -175,7 +169,7 @@ pub fn walk<'a>(
                             path: entry.into_path(),
                             size: meta.len(),
                             modified,
-                            created: created_of(&meta),
+                            created: created_of(&meta, opts.use_creation_time),
                         }));
                     }
                     Err(err) => {

@@ -21,6 +21,11 @@ pub struct Env {
     /// Whether the process is elevated. `from_system` sets false; the CLI sets
     /// it from its elevation check (`run_clean` also overrides it).
     pub elevated: bool,
+    /// Whether file creation time counts towards a file's age (alongside
+    /// mtime). `from_system` sets true; tests set false because creation time
+    /// cannot be backdated, so a freshly written fixture would always look
+    /// new if it were honored.
+    pub use_creation_time: bool,
 }
 
 fn var_path(name: &str) -> Option<PathBuf> {
@@ -40,6 +45,7 @@ impl Env {
             user_profile: var_path("USERPROFILE"),
             now: SystemTime::now(),
             elevated: false,
+            use_creation_time: true,
         }
     }
 }
@@ -123,10 +129,15 @@ pub fn safe_root(p: &Path, env: &Env) -> bool {
 }
 
 /// Walks `roots` and collects every file for which `keep` is true.
-pub fn plan_files(roots: &[PathBuf], keep: impl Fn(&Entry) -> bool) -> Plan {
+pub fn plan_files(
+    roots: &[PathBuf],
+    use_creation_time: bool,
+    keep: impl Fn(&Entry) -> bool,
+) -> Plan {
     let mut plan = Plan::default();
     let opts = WalkOptions {
         strict_links: true,
+        use_creation_time,
         ..WalkOptions::default()
     };
     for item in walk(roots, &opts) {
@@ -153,7 +164,7 @@ pub fn plan_files(roots: &[PathBuf], keep: impl Fn(&Entry) -> bool) -> Plan {
 /// Deletes the plan's files, but only regular files that resolve inside one of
 /// `roots`. Links are never followed or removed. Empty sub-directories are
 /// pruned afterwards (bottom-up, never the roots themselves).
-pub fn delete_checked(roots: &[PathBuf], plan: &Plan) -> ApplyReport {
+pub fn delete_checked(roots: &[PathBuf], plan: &Plan, use_creation_time: bool) -> ApplyReport {
     let mut report = ApplyReport::default();
     let canon_roots: Vec<PathBuf> = roots
         .iter()
@@ -163,7 +174,7 @@ pub fn delete_checked(roots: &[PathBuf], plan: &Plan) -> ApplyReport {
 
     for cand in &plan.items {
         let path = &cand.path;
-        match delete_one(path, &canon_roots, plan.min_age) {
+        match delete_one(path, &canon_roots, plan.min_age, use_creation_time) {
             Ok((canon, size)) => {
                 report.deleted += 1;
                 report.freed += size;
@@ -203,6 +214,7 @@ fn delete_one(
     path: &Path,
     canon_roots: &[PathBuf],
     min_age: Option<Duration>,
+    use_creation_time: bool,
 ) -> Result<(PathBuf, u64), String> {
     let meta =
         fs::symlink_metadata(path).map_err(|e| format!("não foi possível ler o arquivo: {e}"))?;
@@ -232,7 +244,7 @@ fn delete_one(
         let old_enough = meta
             .modified()
             .ok()
-            .and_then(|m| effective_age(m, created_of(&meta), SystemTime::now()))
+            .and_then(|m| effective_age(m, created_of(&meta, use_creation_time), SystemTime::now()))
             .is_some_and(|age| age > min);
         if !old_enough {
             return Err("arquivo modificado recentemente".into());

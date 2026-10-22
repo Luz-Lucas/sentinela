@@ -312,25 +312,26 @@ impl Category for WindowsUpdate {
     }
     fn plan(&self, env: &Env) -> Plan {
         let (roots, mut warnings) = Self::resolved(env);
-        let mut plan = plan_files(&roots, |_| true);
+        let mut plan = plan_files(&roots, env.use_creation_time, |_| true);
         warnings.append(&mut plan.warnings);
         plan.warnings = warnings;
         plan
     }
     fn apply(&self, env: &Env, plan: &Plan) -> ApplyReport {
         let roots = self.roots(env);
+        let use_creation_time = env.use_creation_time;
         #[cfg(windows)]
         {
             run_with_service(
                 query_service_state,
                 || net_service("stop"),
-                || delete_checked(&roots, plan),
+                || delete_checked(&roots, plan, use_creation_time),
                 || net_service("start"),
             )
         }
         #[cfg(not(windows))]
         {
-            delete_checked(&roots, plan)
+            delete_checked(&roots, plan, use_creation_time)
         }
     }
 }
@@ -354,6 +355,7 @@ mod tests {
             user_profile: Some(base.join("profile")),
             now: SystemTime::now(),
             elevated: true,
+            use_creation_time: false,
         }
     }
 
@@ -398,7 +400,7 @@ mod tests {
         fs::write(sd.join("DataStore/db.edb"), b"keep").unwrap();
         let plan = WindowsUpdate.plan(&env);
         // Service control only runs on Windows; test the delete path directly.
-        let rep = delete_checked(&WindowsUpdate.roots(&env), &plan);
+        let rep = delete_checked(&WindowsUpdate.roots(&env), &plan, env.use_creation_time);
         assert_eq!(rep.deleted, 1);
         assert!(!sd.join("Download/a.cab").exists());
         assert!(sd.join("DataStore/db.edb").exists());

@@ -42,7 +42,7 @@ fn finish(mut plan: Plan, mut warnings: Vec<String>) -> Plan {
 
 fn plan_old(env: &Env, roots: &[PathBuf], warnings: Vec<String>) -> Plan {
     let now = env.now;
-    let mut plan = plan_files(roots, |e| {
+    let mut plan = plan_files(roots, env.use_creation_time, |e| {
         effective_age(e.modified, e.created, now).is_some_and(|age| age > MIN_AGE)
     });
     plan.min_age = Some(MIN_AGE);
@@ -92,7 +92,7 @@ impl Category for UserTemp {
         plan_old(env, &roots, warnings)
     }
     fn apply(&self, env: &Env, plan: &Plan) -> ApplyReport {
-        delete_checked(&self.roots(env), plan)
+        delete_checked(&self.roots(env), plan, env.use_creation_time)
     }
 }
 
@@ -120,7 +120,7 @@ impl Category for WindowsTemp {
         plan_old(env, &roots, warnings)
     }
     fn apply(&self, env: &Env, plan: &Plan) -> ApplyReport {
-        delete_checked(&self.roots(env), plan)
+        delete_checked(&self.roots(env), plan, env.use_creation_time)
     }
 }
 
@@ -168,9 +168,12 @@ impl Category for CrashDumps {
     }
     fn plan(&self, env: &Env) -> Plan {
         let (roots, warnings) = Self::resolved(env);
-        finish(plan_files(&roots, |_| true), warnings)
+        finish(
+            plan_files(&roots, env.use_creation_time, |_| true),
+            warnings,
+        )
     }
     fn apply(&self, env: &Env, plan: &Plan) -> ApplyReport {
-        delete_checked(&self.roots(env), plan)
+        delete_checked(&self.roots(env), plan, env.use_creation_time)
     }
 }

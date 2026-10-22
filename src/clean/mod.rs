@@ -123,6 +123,7 @@ mod tests {
             user_profile: Some(profile),
             now: SystemTime::now(),
             elevated: false,
+            use_creation_time: false,
         }
     }
 
@@ -177,6 +178,21 @@ mod tests {
         assert_eq!(applied.freed, 3);
     }
 
+    /// An old mtime does not make a freshly-written file old when creation
+    /// time is honored: the file's real creation time (just now) wins over
+    /// the backdated mtime, so it is not planned for deletion.
+    #[test]
+    fn old_mtime_but_recent_creation_not_planned_when_creation_time_enabled() {
+        let d = tempfile::tempdir().unwrap();
+        let mut env = env_in(d.path());
+        env.use_creation_time = true;
+        let t = env.temp.clone().unwrap();
+        write_aged(&t.join("old.tmp"), b"old", two_days());
+        let p = UserTemp.plan(&env);
+        assert_eq!(p.files, 0);
+        assert!(t.join("old.tmp").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_escape_blocked() {
@@ -199,7 +215,7 @@ mod tests {
             }],
             ..Plan::default()
         };
-        let rep = delete_checked(std::slice::from_ref(&t), &plan);
+        let rep = delete_checked(std::slice::from_ref(&t), &plan, false);
         assert_eq!(rep.deleted, 0);
         assert_eq!(rep.skipped.len(), 1);
         assert!(outside.join("secret.txt").exists());
@@ -228,7 +244,7 @@ mod tests {
             warnings: vec![],
             min_age: None,
         };
-        let rep = delete_checked(&[t], &plan);
+        let rep = delete_checked(&[t], &plan, false);
         assert_eq!(rep.deleted, 0);
         assert_eq!(rep.skipped.len(), 2);
         assert!(victim.exists());

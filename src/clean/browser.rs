@@ -158,14 +158,14 @@ impl Category for BrowserCache {
     }
     fn plan(&self, env: &Env) -> Plan {
         let (roots, mut warnings) = self.resolved(env);
-        let mut plan = plan_files(&roots, |_| true);
+        let mut plan = plan_files(&roots, env.use_creation_time, |_| true);
         warnings.append(&mut plan.warnings);
         plan.warnings = warnings;
         plan.min_age = None;
         plan
     }
     fn apply(&self, env: &Env, plan: &Plan) -> ApplyReport {
-        delete_checked(&self.roots(env), plan)
+        delete_checked(&self.roots(env), plan, env.use_creation_time)
     }
 }
 
@@ -184,6 +184,7 @@ mod tests {
             user_profile: None,
             now: SystemTime::now(),
             elevated: false,
+            use_creation_time: false,
         }
     }
 
