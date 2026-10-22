@@ -4,6 +4,8 @@ use serde_json::json;
 
 use crate::clean::CleanReport;
 use crate::finder::{DupGroup, LargeFile};
+use crate::full::FullReport;
+use crate::quarantine::QuarantineEntry;
 use crate::scan::ScanReport;
 use crate::scan::detector::Severity;
 use crate::walker::WalkError;
@@ -181,6 +183,132 @@ pub fn write_clean(
             human_bytes(bytes)
         )
     }
+}
+
+/// Report of `sentinela full`: scan summary, quarantine, report-only
+/// detections and the clean-up breakdown.
+pub fn write_full(report: &FullReport, json: bool, out: &mut dyn Write) -> std::io::Result<()> {
+    let (cleaned, freed) = report
+        .clean
+        .as_ref()
+        .map(|c| {
+            c.categories
+                .iter()
+                .filter_map(|r| r.applied.as_ref())
+                .fold((0u64, 0u64), |(d, f), a| (d + a.deleted, f + a.freed))
+        })
+        .unwrap_or((0, 0));
+    if json {
+        let doc = json!({
+            "version": 1,
+            "summary": {
+                "scanned": report.scanned,
+                "quarantined": report.quarantined.len(),
+                "quarantine_failures": report.quarantine_failures.len(),
+                "reported": report.reported.len(),
+                "errors": report.scan_errors.len(),
+                "interrupted": report.interrupted,
+                "cleaned": cleaned,
+                "freed": freed,
+            },
+            "quarantined": report.quarantined,
+            "quarantine_failures": report.quarantine_failures,
+            "reported": report.reported,
+            "clean": report.clean.as_ref().map(|c| &c.categories),
+            "errors": report.scan_errors,
+        });
+        return write_json(out, &doc);
+    }
+
+    writeln!(
+        out,
+        "Verificados: {} | Em quarentena: {} | Suspeitos (só relatados): {} | Erros: {}",
+        report.scanned,
+        report.quarantined.len(),
+        report.reported.len(),
+        report.scan_errors.len()
+    )?;
+    if report.interrupted {
+        writeln!(out, "Varredura interrompida: a limpeza não foi executada.")?;
+    }
+    writeln!(out, "\nQuarentena (malware confirmado por hash):")?;
+    if report.quarantined.is_empty() && report.quarantine_failures.is_empty() {
+        writeln!(out, "  nada em quarentena nesta execução")?;
+    }
+    for e in &report.quarantined {
+        writeln!(
+            out,
+            "  {} — {} (id {}; restaurar: sentinela restore {})",
+            e.original_path.display(),
+            e.rule,
+            e.id,
+            e.id
+        )?;
+    }
+    for f in &report.quarantine_failures {
+        writeln!(
+            out,
+            "  FALHA ao isolar {} — {}: {}",
+            f.path.display(),
+            f.rule,
+            f.reason
+        )?;
+    }
+    if !report.reported.is_empty() {
+        writeln!(
+            out,
+            "\nSuspeitos (apenas relatados, nenhum arquivo foi alterado):"
+        )?;
+        for item in &report.reported {
+            let rules: Vec<&str> = item.findings.iter().map(|f| f.rule.as_str()).collect();
+            writeln!(
+                out,
+                "  {} {} — {}",
+                label(item.verdict),
+                item.path.display(),
+                rules.join(", ")
+            )?;
+        }
+    }
+    writeln!(out, "\nLimpeza:")?;
+    match &report.clean {
+        Some(clean) => write_clean(clean, true, false, out)?,
+        None => writeln!(out, "  não executada")?,
+    }
+    write_walk_errors(out, &report.scan_errors)
+}
+
+pub fn write_quarantine_list(
+    entries: &[QuarantineEntry],
+    json: bool,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    if json {
+        let doc = json!({
+            "version": 1,
+            "summary": {
+                "count": entries.len(),
+                "bytes": entries.iter().map(|e| e.size).sum::<u64>(),
+            },
+            "items": entries,
+        });
+        return write_json(out, &doc);
+    }
+    if entries.is_empty() {
+        return writeln!(out, "Quarentena vazia.");
+    }
+    for e in entries {
+        writeln!(
+            out,
+            "{}  {}  {}  {} — {}",
+            e.id,
+            e.quarantined_at,
+            human_bytes(e.size),
+            e.original_path.display(),
+            e.rule
+        )?;
+    }
+    writeln!(out, "\nPara restaurar: sentinela restore <id>")
 }
 
 pub fn write_finder_large(

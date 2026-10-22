@@ -151,7 +151,7 @@ fn rfc3339_utc(secs: u64) -> String {
     )
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
