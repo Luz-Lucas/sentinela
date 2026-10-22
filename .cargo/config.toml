@@ -1,0 +1,4 @@
+# Statically link the MSVC C runtime so the release .exe does not need
+# VCRUNTIME140.dll (the Visual C++ Redistributable) on the user's PC.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

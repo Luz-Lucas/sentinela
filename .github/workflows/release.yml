@@ -20,4 +20,5 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" target/release/sentinela.exe --generate-notes
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" target/release/sentinela.exe --generate-notes

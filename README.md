@@ -62,7 +62,7 @@ Banco atualizado em C:\Users\eu\AppData\Local\Sentinela\db
   Regras YARA: 112 arquivo(s) aceito(s), 3 rejeitado(s), 640 regra(s) no total
 ```
 
-O banco fica em `%LOCALAPPDATA%\Sentinela\db` (altere com a variável `SENTINELA_DB_DIR`). Sem rodar `update`, o `scan` ainda funciona com a assinatura embutida do arquivo de teste EICAR.
+O banco fica em `%LOCALAPPDATA%\Sentinela\db` (altere com a variável `SENTINELA_DB_DIR`; o `update` recusa substituir uma pasta existente, não vazia, que não pareça um banco do Sentinela — sem `manifest.json`, `hashes.txt` ou `rules/` — então aponte para uma pasta vazia ou inexistente). Se o banco ainda não foi inicializado, o `scan` avisa no stderr. Sem rodar `update`, o `scan` ainda funciona com a assinatura embutida do arquivo de teste EICAR.
 
 Os hashes vêm do MalwareBazaar (abuse.ch), que exige uma chave de autenticação **gratuita**: crie uma conta em <https://auth.abuse.ch/> e defina a variável de ambiente `ABUSE_CH_AUTH_KEY`:
 
@@ -90,7 +90,7 @@ windows-update pulada (requer administrador)
 Total que seria liberado: 5082 arquivo(s), 3.9 GB. Simulação: nada foi apagado; use --apply para limpar.
 ```
 
-Para apagar de verdade, use `--apply`. O Sentinela mostra o total e pergunta `[s/N]` (qualquer resposta diferente de `s`, `S` ou `sim` cancela). Use `--yes` para pular a pergunta (útil em scripts):
+Para apagar de verdade, use `--apply`. O Sentinela lista (no stderr) cada categoria com arquivos e tamanho, avisa quando a Lixeira será esvaziada permanentemente, lista as categorias ignoradas (ex.: requer administrador) e pergunta `[s/N]` (qualquer resposta diferente de `s`, `S` ou `sim` cancela). Use `--yes` para pular a pergunta (útil em scripts):
 
 ```
 > sentinela clean --category user-temp --category crash-dumps --apply
@@ -165,3 +165,7 @@ O binário fica em `target/release/sentinela` (`sentinela.exe` no Windows). Ao p
 ## Licença
 
 MIT, veja [LICENSE](LICENSE).
+
+## Links e arquivos somente na nuvem
+
+O `scan` e o `find` não seguem links simbólicos nem junções; cada um é listado como erro (`link simbólico/junção ignorado`), inclusive quando a pasta raiz é um link. Arquivos do OneDrive (Files On-Demand) que ainda não foram baixados não são lidos, para não disparar o download: aparecem como erro `arquivo somente na nuvem (não baixado); não verificado`. Já a limpeza (`clean`) é mais estrita e recusa qualquer ponto de reanálise. A idade mínima de 24 h dos temporários considera a mais recente entre a data de modificação e a de criação.
