@@ -20,12 +20,15 @@ pub struct CleanReport {
     pub categories: Vec<CategoryResult>,
 }
 
-/// Categories in spec order. Tasks 10/11/13 append the remaining ones.
+/// All categories, in spec order.
 pub fn all_categories() -> Vec<Box<dyn Category>> {
     vec![
         Box::new(categories::UserTemp),
         Box::new(categories::WindowsTemp),
         Box::new(categories::CrashDumps),
+        Box::new(browser::BrowserCache::default()),
+        Box::new(platform::RecycleBin),
+        Box::new(platform::WindowsUpdate),
     ]
 }
 
@@ -455,6 +458,16 @@ mod tests {
     #[test]
     fn all_categories_in_spec_order() {
         let ids: Vec<_> = all_categories().iter().map(|c| c.id()).collect();
-        assert_eq!(ids, vec!["user-temp", "windows-temp", "crash-dumps"]);
+        assert_eq!(
+            ids,
+            vec![
+                "user-temp",
+                "windows-temp",
+                "crash-dumps",
+                "browser-cache",
+                "recycle-bin",
+                "windows-update"
+            ]
+        );
     }
 }
