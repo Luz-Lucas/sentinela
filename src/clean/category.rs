@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
-use crate::walker::{Entry, WalkItem, WalkOptions, is_link_like, walk};
+use crate::walker::{Entry, WalkItem, WalkOptions, created_of, is_link_like, walk};
 
 /// Environment the categories resolve their roots from.
 #[derive(Debug, Clone)]
@@ -76,6 +76,17 @@ pub trait Category: Send + Sync {
     fn apply(&self, env: &Env, plan: &Plan) -> ApplyReport;
 }
 
+/// Age of a file as `now - max(modified, created)`; `created` is ignored when
+/// unavailable. `None` when the newest timestamp is in the future.
+pub fn effective_age(
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    now: SystemTime,
+) -> Option<Duration> {
+    let newest = created.map_or(modified, |c| c.max(modified));
+    now.duration_since(newest).ok()
+}
+
 /// Canonical form when the path exists, otherwise the path as given.
 fn normalize(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
@@ -114,7 +125,10 @@ pub fn safe_root(p: &Path, env: &Env) -> bool {
 /// Walks `roots` and collects every file for which `keep` is true.
 pub fn plan_files(roots: &[PathBuf], keep: impl Fn(&Entry) -> bool) -> Plan {
     let mut plan = Plan::default();
-    let opts = WalkOptions::default();
+    let opts = WalkOptions {
+        strict_links: true,
+        ..WalkOptions::default()
+    };
     for item in walk(roots, &opts) {
         match item {
             WalkItem::File(e) => {
@@ -218,7 +232,7 @@ fn delete_one(
         let old_enough = meta
             .modified()
             .ok()
-            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .and_then(|m| effective_age(m, created_of(&meta), SystemTime::now()))
             .is_some_and(|age| age > min);
         if !old_enough {
             return Err("arquivo modificado recentemente".into());
@@ -226,4 +240,36 @@ fn delete_one(
     }
     fs::remove_file(&canon).map_err(|e| format!("não foi possível apagar: {e}"))?;
     Ok((canon, meta.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_age_uses_the_most_recent_timestamp() {
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(10 * 24 * 3600);
+        let recent = now - Duration::from_secs(60);
+        // Old mtime but recent creation (e.g. an extracted archive): young.
+        assert_eq!(
+            effective_age(old, Some(recent), now),
+            Some(Duration::from_secs(60))
+        );
+        // Created long ago, modified recently: young as well.
+        assert_eq!(
+            effective_age(recent, Some(old), now),
+            Some(Duration::from_secs(60))
+        );
+        // No creation time available: falls back to modified.
+        assert_eq!(
+            effective_age(old, None, now),
+            Some(Duration::from_secs(10 * 24 * 3600))
+        );
+        // Timestamps in the future: unknown age, never "old".
+        assert_eq!(
+            effective_age(now + Duration::from_secs(60), None, now),
+            None
+        );
+    }
 }

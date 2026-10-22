@@ -1,4 +1,4 @@
-//! Safe directory traversal: never follows symlinks, junctions or reparse points.
+//! Safe directory traversal: never follows symlinks or junctions.
 
 use std::fs::Metadata;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub size: u64,
     pub modified: SystemTime,
+    pub created: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,22 +29,78 @@ pub enum WalkItem {
 #[derive(Default)]
 pub struct WalkOptions {
     pub excludes: Option<globset::GlobSet>,
+    /// Treat ANY reparse point (not only symlinks/junctions) as a link. Used
+    /// by the cleaner, which must never touch cloud placeholders or the like.
+    pub strict_links: bool,
 }
 
-/// True for symlinks and, on Windows, any reparse point (junctions etc.).
-pub fn is_link_like(meta: &Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryClass {
+    Normal,
+    /// Symlink / junction (or, in strict mode, any reparse point).
+    Link,
+    /// Cloud-only placeholder: reading it would trigger a download.
+    CloudOnly,
+}
+
+/// Pure classification from Windows file attributes and the std symlink flag
+/// (`FileType::is_symlink`, which on Windows covers symlinks and junctions).
+pub fn classify_attrs(attrs: u32, is_symlink: bool, strict: bool) -> EntryClass {
+    if is_symlink || (strict && attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0) {
+        EntryClass::Link
+    } else if attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_OFFLINE) != 0 {
+        EntryClass::CloudOnly
+    } else {
+        EntryClass::Normal
     }
+}
+
+/// Creation time when the platform reports it. Unit tests report `None`
+/// because creation time cannot be backdated on Linux; the age rule itself is
+/// covered by the pure `effective_age` tests.
+pub(crate) fn created_of(meta: &Metadata) -> Option<SystemTime> {
+    #[cfg(test)]
+    {
+        let _ = meta;
+        None
+    }
+    #[cfg(not(test))]
+    {
+        meta.created().ok()
+    }
+}
+
+fn attrs_of(meta: &Metadata) -> u32 {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
+        meta.file_attributes()
     }
-    false
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+fn classify(meta: &Metadata, strict: bool) -> EntryClass {
+    classify_attrs(attrs_of(meta), meta.file_type().is_symlink(), strict)
+}
+
+/// Strict: true for symlinks and, on Windows, ANY reparse point. Used by the
+/// cleaner's deletion checks and browser profile discovery.
+pub fn is_link_like(meta: &Metadata) -> bool {
+    classify(meta, true) == EntryClass::Link
+}
+
+/// Walker traversal: symlinks and junctions (name-surrogate reparse points).
+/// Other reparse points (e.g. OneDrive) are walked normally.
+pub fn is_traversal_link(meta: &Metadata) -> bool {
+    classify(meta, false) == EntryClass::Link
 }
 
 pub fn walk<'a>(
@@ -53,14 +110,18 @@ pub fn walk<'a>(
     roots.iter().flat_map(move |root| {
         WalkDir::new(root)
             .follow_links(false)
+            .follow_root_links(false)
             .into_iter()
             .filter_entry(move |e| {
                 if e.depth() == 0 {
                     return true;
                 }
-                // Prune link-like directories (junctions, reparse points) so
-                // we never descend into them.
-                if e.metadata().is_ok_and(|m| is_link_like(&m)) {
+                // Strict mode: never descend into directories that are any
+                // kind of reparse point. (Symlinks are never descended anyway.)
+                if opts.strict_links
+                    && e.file_type().is_dir()
+                    && e.metadata().is_ok_and(|m| is_link_like(&m))
+                {
                     return false;
                 }
                 match &opts.excludes {
@@ -68,7 +129,7 @@ pub fn walk<'a>(
                     None => true,
                 }
             })
-            .filter_map(|res| match res {
+            .filter_map(move |res| match res {
                 Err(err) => Some(WalkItem::Error(WalkError {
                     path: err.path().map(PathBuf::from).unwrap_or_default(),
                     reason: err.to_string(),
@@ -83,14 +144,29 @@ pub fn walk<'a>(
                             }));
                         }
                     };
-                    if is_link_like(&meta) || !meta.is_file() {
+                    let class = classify(&meta, opts.strict_links);
+                    if class == EntryClass::Link {
+                        return Some(WalkItem::Error(WalkError {
+                            path: entry.path().to_path_buf(),
+                            reason: "link simbólico/junção ignorado".to_string(),
+                        }));
+                    }
+                    if !meta.is_file() {
                         return None;
+                    }
+                    if class == EntryClass::CloudOnly {
+                        return Some(WalkItem::Error(WalkError {
+                            path: entry.path().to_path_buf(),
+                            reason: "arquivo somente na nuvem (não baixado); não verificado"
+                                .to_string(),
+                        }));
                     }
                     match meta.modified() {
                         Ok(modified) => Some(WalkItem::File(Entry {
                             path: entry.into_path(),
                             size: meta.len(),
                             modified,
+                            created: created_of(&meta),
                         })),
                         Err(err) => Some(WalkItem::Error(WalkError {
                             path: entry.path().to_path_buf(),
@@ -163,6 +239,7 @@ mod tests {
         b.add(globset::Glob::new("**/*.log").unwrap());
         let opts = WalkOptions {
             excludes: Some(b.build().unwrap()),
+            ..WalkOptions::default()
         };
         let roots = vec![d.path().to_path_buf()];
         let v = files_of(walk(&roots, &opts).collect());
@@ -183,6 +260,58 @@ mod tests {
         let v = files_of(walk(&roots, &opts).collect());
         assert_eq!(v.len(), 1);
         assert!(v[0].path.ends_with("in.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_is_reported_as_error() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"s").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let items: Vec<_> = walk(&roots, &WalkOptions::default()).collect();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            WalkItem::Error(e) => assert!(e.reason.contains("link simbólico"), "{}", e.reason),
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_root_yields_error() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"s").unwrap();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("rootlink");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let roots = vec![link];
+        let items: Vec<_> = walk(&roots, &WalkOptions::default()).collect();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], WalkItem::Error(_)));
+    }
+
+    #[test]
+    fn classify_attrs_rules() {
+        const REPARSE: u32 = 0x400;
+        const RECALL: u32 = 0x0040_0000;
+        const OFFLINE: u32 = 0x1000;
+        assert_eq!(classify_attrs(0x20, false, false), EntryClass::Normal);
+        assert_eq!(classify_attrs(0, true, false), EntryClass::Link);
+        // OneDrive placeholder: reparse point + recall flag.
+        assert_eq!(
+            classify_attrs(REPARSE | RECALL, false, false),
+            EntryClass::CloudOnly
+        );
+        assert_eq!(classify_attrs(OFFLINE, false, false), EntryClass::CloudOnly);
+        // Other reparse points are walked normally unless strict.
+        assert_eq!(classify_attrs(REPARSE, false, false), EntryClass::Normal);
+        assert_eq!(classify_attrs(REPARSE, false, true), EntryClass::Link);
+        assert_eq!(
+            classify_attrs(REPARSE | RECALL, false, true),
+            EntryClass::Link
+        );
     }
 
     #[cfg(unix)]

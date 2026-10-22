@@ -326,6 +326,7 @@ mod tests {
             path: path.clone(),
             size: 1,
             modified: std::time::SystemTime::now(),
+            created: None,
         };
         fs::remove_file(&path).unwrap();
         let (engine, _) = Engine::from_database(&marker_db());

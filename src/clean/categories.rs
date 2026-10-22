@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::category::{ApplyReport, Category, Env, Plan, delete_checked, plan_files, safe_root};
+use super::category::{
+    ApplyReport, Category, Env, Plan, delete_checked, effective_age, plan_files, safe_root,
+};
 
 /// Temporary files younger than this are never touched.
 pub const MIN_AGE: Duration = Duration::from_secs(24 * 3600);
@@ -41,8 +43,7 @@ fn finish(mut plan: Plan, mut warnings: Vec<String>) -> Plan {
 fn plan_old(env: &Env, roots: &[PathBuf], warnings: Vec<String>) -> Plan {
     let now = env.now;
     let mut plan = plan_files(roots, |e| {
-        now.duration_since(e.modified)
-            .is_ok_and(|age| age > MIN_AGE)
+        effective_age(e.modified, e.created, now).is_some_and(|age| age > MIN_AGE)
     });
     plan.min_age = Some(MIN_AGE);
     finish(plan, warnings)

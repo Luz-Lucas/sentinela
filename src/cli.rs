@@ -193,7 +193,10 @@ fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>
 
     let opts = ScanOptions {
         roots: paths,
-        walk: WalkOptions { excludes },
+        walk: WalkOptions {
+            excludes,
+            ..WalkOptions::default()
+        },
         max_size,
     };
     let scan = run_scan(&engine, &opts, &cancel);
