@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::clean::category::{Category, Env};
 use crate::clean::{self, CleanReport};
 use crate::quarantine::{self, QuarantineEntry};
-use crate::scan::{Engine, ScanItem, ScanOptions, ScanReport, run_scan};
+use crate::scan::{Engine, Progress, ScanItem, ScanOptions, ScanReport, run_scan_with_progress};
 use crate::signatures;
 use crate::walker::{WalkError, WalkOptions};
 
@@ -28,6 +28,8 @@ pub struct FullOptions<'a> {
     pub elevated: bool,
     pub max_size: u64,
     pub cancel: &'a AtomicBool,
+    /// Drives the scan phase only; the clean phase prints its own lines.
+    pub progress: &'a dyn Progress,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,7 +127,7 @@ pub fn run_full(opts: &FullOptions) -> FullReport {
     let mut warnings = db.warnings.clone();
     warnings.extend(engine_warnings);
 
-    let scan = run_scan(
+    let scan = run_scan_with_progress(
         &engine,
         &ScanOptions {
             roots: opts.roots.clone(),
@@ -133,6 +135,7 @@ pub fn run_full(opts: &FullOptions) -> FullReport {
             max_size: opts.max_size,
         },
         opts.cancel,
+        opts.progress,
     );
     let ScanReport {
         scanned,
@@ -341,6 +344,7 @@ mod tests {
             elevated: false,
             max_size: 256 * 1024 * 1024,
             cancel,
+            progress: &crate::scan::NoProgress,
         }
     }
 

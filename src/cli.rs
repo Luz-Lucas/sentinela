@@ -9,8 +9,9 @@ use clap::{Parser, Subcommand};
 use crate::clean::category::Env;
 use crate::clean::{self, CleanReport, platform};
 use crate::full::{self, FullOptions};
+use crate::progress::{self, TerminalProgress};
 use crate::report::{self, human_bytes};
-use crate::scan::{Engine, ScanOptions, run_scan};
+use crate::scan::{Engine, NoProgress, Progress, ScanOptions, run_scan_with_progress};
 use crate::walker::WalkOptions;
 use crate::{finder, platform_fs, quarantine, signatures, updater};
 
@@ -190,6 +191,15 @@ fn require_exists(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Live bar on stderr, only when it cannot corrupt `--json` or piped output.
+fn make_progress(json: bool) -> Box<dyn Progress> {
+    if progress::bar_enabled(json) {
+        Box::new(TerminalProgress::new())
+    } else {
+        Box::new(NoProgress)
+    }
+}
+
 fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>) -> Result<i32> {
     require_exists(&paths)?;
     let max_size = max_size
@@ -239,7 +249,8 @@ fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>
         },
         max_size,
     };
-    let scan = run_scan(&engine, &opts, &cancel);
+    let progress = make_progress(json);
+    let scan = run_scan_with_progress(&engine, &opts, &cancel, &*progress);
     report::write_scan(&scan, json, &mut io::stdout().lock())?;
     Ok(scan.exit_code())
 }
@@ -286,6 +297,7 @@ fn cmd_full(json: bool, roots_override: Vec<PathBuf>) -> Result<i32> {
             eprintln!("aviso: não foi possível registrar o Ctrl+C: {e}");
         }
     }
+    let progress = make_progress(json);
     let elevated = platform::is_elevated();
     let mut env = Env::from_system();
     env.elevated = elevated;
@@ -298,6 +310,7 @@ fn cmd_full(json: bool, roots_override: Vec<PathBuf>) -> Result<i32> {
         elevated,
         max_size: 256 * 1024 * 1024,
         cancel: &cancel,
+        progress: &*progress,
     });
     for w in &report.warnings {
         eprintln!("aviso: {w}");
