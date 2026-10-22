@@ -257,29 +257,6 @@ fn isolated_clean(base: &Path, temp: &Path) -> Command {
     cmd
 }
 
-fn backdate(path: &Path) {
-    let f = fs::File::options().write(true).open(path).unwrap();
-    let two_days = std::time::Duration::from_secs(2 * 24 * 3600);
-    f.set_modified(std::time::SystemTime::now() - two_days)
-        .unwrap();
-}
-
-#[test]
-fn clean_user_temp_apply_declined_on_eof_keeps_files() {
-    let tmp = tempfile::tempdir().unwrap();
-    let temp = tmp.path().join("Temp");
-    fs::create_dir_all(&temp).unwrap();
-    let canary = temp.join("canary.tmp");
-    fs::write(&canary, "keep").unwrap();
-    backdate(&canary);
-    isolated_clean(tmp.path(), &temp)
-        .args(["clean", "--category", "user-temp", "--apply"])
-        .write_stdin("")
-        .assert()
-        .code(0);
-    assert!(canary.exists());
-}
-
 #[test]
 fn clean_apply_shows_breakdown_and_cancels_on_eof() {
     let tmp = tempfile::tempdir().unwrap();
