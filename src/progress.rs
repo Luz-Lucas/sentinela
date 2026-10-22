@@ -10,7 +10,15 @@ use crate::report::human_bytes;
 use crate::scan::Progress;
 
 const BAR_CELLS: usize = 20;
-const DEFAULT_WIDTH: usize = 100;
+/// Used when the terminal width is unknown. Stays under the classic 80
+/// columns (72 on Windows consoles) so a redraw never wraps.
+#[cfg(windows)]
+const DEFAULT_WIDTH: usize = 72;
+#[cfg(not(windows))]
+const DEFAULT_WIDTH: usize = 79;
+/// Longer ETAs are noise (near-zero throughput).
+const MAX_ETA_SECS: f64 = 99.0 * 3600.0;
+const MAX_WIDTH: usize = 100;
 const REDRAW_EVERY: Duration = Duration::from_millis(100);
 
 /// True when a live bar makes sense: not `--json` and stderr is a terminal.
@@ -90,7 +98,12 @@ pub fn render_line(
     let eta = if remaining == 0 && (total_bytes > 0 || files_done >= total_files) {
         human_eta(0)
     } else if throughput_bps > 0.0 && total_bytes > 0 {
-        human_eta((remaining as f64 / throughput_bps).ceil() as u64)
+        let secs = (remaining as f64 / throughput_bps).ceil();
+        if secs > MAX_ETA_SECS {
+            "--:--".to_string()
+        } else {
+            human_eta(secs as u64)
+        }
     } else {
         "--:--".to_string()
     };
@@ -105,7 +118,7 @@ pub fn render_line(
     let used = stats.chars().count();
     // " · " separator plus at least a few chars of path, else drop the path.
     let line = if width > used + 3 + 8 {
-        let path = truncate_path(&current.display().to_string(), width - used - 3);
+        let path = truncate_path(&sanitize(&current.display().to_string()), width - used - 3);
         format!("{stats} · {path}")
     } else {
         stats
@@ -117,13 +130,24 @@ fn truncate_path_end(s: &str, width: usize) -> String {
     s.chars().take(width).collect()
 }
 
-fn term_width() -> usize {
-    // COLUMNS is only set by some shells; the fixed cap is the fallback.
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse::<usize>().ok())
+fn width_from_columns(columns: Option<&str>) -> usize {
+    columns
+        .and_then(|c| c.trim().parse::<usize>().ok())
         .filter(|&c| c > 20)
-        .map_or(DEFAULT_WIDTH, |c| (c - 1).min(DEFAULT_WIDTH))
+        .map_or(DEFAULT_WIDTH, |c| (c - 1).min(MAX_WIDTH))
+}
+
+fn term_width() -> usize {
+    // COLUMNS is often unset (bash does not export it); then use the default.
+    width_from_columns(std::env::var("COLUMNS").ok().as_deref())
+}
+
+/// Paths come from scanned files and may hold newlines or escape sequences;
+/// they must never reach the terminal raw.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 struct State {
@@ -338,6 +362,29 @@ mod tests {
         let l = line(1, 10, 10, 100, 10.0, "C:\\some\\file.exe", 60);
         assert!(l.chars().count() <= 60);
         assert!(!l.contains("file.exe"));
+    }
+
+    #[test]
+    fn control_chars_in_path_are_neutralized() {
+        let l = line(1, 10, 10, 100, 10.0, "a\x1b[2J\n\rb\u{7}\u{9b}c.exe", 200);
+        assert!(!l.chars().any(char::is_control), "{l:?}");
+        assert!(l.ends_with("a?[2J??b??c.exe"), "{l:?}");
+    }
+
+    #[test]
+    fn absurd_eta_is_hidden() {
+        let l = line(1, 10, 1, 1 << 40, 0.001, "p", 200);
+        assert!(l.contains("ETA --:--"), "{l}");
+        let l = line(1, 10, 1, 1000, 1.0, "p", 200);
+        assert!(l.contains("ETA 16:39"), "{l}");
+    }
+
+    #[test]
+    fn width_default_and_columns() {
+        assert!(width_from_columns(None) <= 79);
+        assert_eq!(width_from_columns(Some("junk")), width_from_columns(None));
+        assert_eq!(width_from_columns(Some("120")), 100);
+        assert_eq!(width_from_columns(Some("60")), 59);
     }
 
     #[test]
