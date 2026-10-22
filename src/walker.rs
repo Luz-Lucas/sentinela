@@ -108,7 +108,7 @@ pub fn walk<'a>(
     opts: &'a WalkOptions,
 ) -> impl Iterator<Item = WalkItem> + 'a {
     roots.iter().flat_map(move |root| {
-        WalkDir::new(root)
+        let mut it = WalkDir::new(root)
             .follow_links(false)
             .follow_root_links(false)
             .into_iter()
@@ -116,65 +116,77 @@ pub fn walk<'a>(
                 if e.depth() == 0 {
                     return true;
                 }
-                // Strict mode: never descend into directories that are any
-                // kind of reparse point. (Symlinks are never descended anyway.)
-                if opts.strict_links
-                    && e.file_type().is_dir()
-                    && e.metadata().is_ok_and(|m| is_link_like(&m))
-                {
-                    return false;
-                }
                 match &opts.excludes {
                     Some(set) => !set.is_match(e.path()),
                     None => true,
                 }
-            })
-            .filter_map(move |res| match res {
-                Err(err) => Some(WalkItem::Error(WalkError {
-                    path: err.path().map(PathBuf::from).unwrap_or_default(),
-                    reason: err.to_string(),
-                })),
-                Ok(entry) => {
-                    let meta = match entry.metadata() {
-                        Ok(m) => m,
-                        Err(err) => {
-                            return Some(WalkItem::Error(WalkError {
-                                path: entry.path().to_path_buf(),
-                                reason: err.to_string(),
-                            }));
-                        }
-                    };
-                    let class = classify(&meta, opts.strict_links);
-                    if class == EntryClass::Link {
+            });
+        std::iter::from_fn(move || {
+            loop {
+                let entry = match it.next()? {
+                    Err(err) => {
                         return Some(WalkItem::Error(WalkError {
-                            path: entry.path().to_path_buf(),
-                            reason: "link simbólico/junção ignorado".to_string(),
+                            path: err.path().map(PathBuf::from).unwrap_or_default(),
+                            reason: err.to_string(),
                         }));
                     }
-                    if !meta.is_file() {
-                        return None;
-                    }
-                    if class == EntryClass::CloudOnly {
+                    Ok(entry) => entry,
+                };
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(err) => {
                         return Some(WalkItem::Error(WalkError {
                             path: entry.path().to_path_buf(),
-                            reason: "arquivo somente na nuvem (não baixado); não verificado"
-                                .to_string(),
+                            reason: err.to_string(),
                         }));
                     }
-                    match meta.modified() {
-                        Ok(modified) => Some(WalkItem::File(Entry {
+                };
+                let class = classify(&meta, opts.strict_links);
+                if class == EntryClass::Link {
+                    if meta.is_dir() {
+                        // Strict mode: never descend into a reparse-point
+                        // directory that is not itself a symlink/junction (e.g. a
+                        // OneDrive placeholder folder). Real symlinks never reach
+                        // here as a directory (lstat reports them as links).
+                        it.skip_current_dir();
+                        return Some(WalkItem::Error(WalkError {
+                            path: entry.path().to_path_buf(),
+                            reason: "ponto de reparse ignorado".to_string(),
+                        }));
+                    }
+                    return Some(WalkItem::Error(WalkError {
+                        path: entry.path().to_path_buf(),
+                        reason: "link simbólico/junção ignorado".to_string(),
+                    }));
+                }
+                if !meta.is_file() {
+                    continue;
+                }
+                if class == EntryClass::CloudOnly {
+                    return Some(WalkItem::Error(WalkError {
+                        path: entry.path().to_path_buf(),
+                        reason: "arquivo somente na nuvem (não baixado); não verificado"
+                            .to_string(),
+                    }));
+                }
+                match meta.modified() {
+                    Ok(modified) => {
+                        return Some(WalkItem::File(Entry {
                             path: entry.into_path(),
                             size: meta.len(),
                             modified,
                             created: created_of(&meta),
-                        })),
-                        Err(err) => Some(WalkItem::Error(WalkError {
+                        }));
+                    }
+                    Err(err) => {
+                        return Some(WalkItem::Error(WalkError {
                             path: entry.path().to_path_buf(),
                             reason: err.to_string(),
-                        })),
+                        }));
                     }
                 }
-            })
+            }
+        })
     })
 }
 
@@ -290,6 +302,21 @@ mod tests {
         let items: Vec<_> = walk(&roots, &WalkOptions::default()).collect();
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], WalkItem::Error(_)));
+    }
+
+    #[test]
+    fn strict_mode_still_descends_into_normal_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("a/b")).unwrap();
+        fs::write(d.path().join("a/b/deep.txt"), b"x").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let opts = WalkOptions {
+            strict_links: true,
+            ..WalkOptions::default()
+        };
+        let v = files_of(walk(&roots, &opts).collect());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].path.ends_with("a/b/deep.txt"));
     }
 
     #[test]
