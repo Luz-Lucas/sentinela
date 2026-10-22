@@ -7,6 +7,7 @@ edition = "2024"
 clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 ureq = { version = "3.5.0", features = ["rustls"] }
+yara-x = "1.22.0"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
