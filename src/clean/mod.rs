@@ -395,6 +395,23 @@ mod tests {
         assert_eq!(UserTemp.plan(&e).files, 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn temp_symlink_to_other_dir_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let mut e = env_in(d.path());
+        let docs = d.path().join("elsewhere/Docs");
+        write_aged(&docs.join("a.txt"), b"x", two_days());
+        let link = d.path().join("lnk/Temp");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&docs, &link).unwrap();
+        e.temp = Some(link);
+        let p = UserTemp.plan(&e);
+        assert_eq!(p.files, 0);
+        assert!(!p.warnings.is_empty());
+        assert!(docs.join("a.txt").exists());
+    }
+
     #[test]
     fn age_rechecked_at_delete_time() {
         let d = tempfile::tempdir().unwrap();

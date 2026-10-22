@@ -227,3 +227,75 @@ fn info_without_db_says_not_initialized() {
         .success()
         .stdout(contains("banco não inicializado"));
 }
+
+#[test]
+fn scan_warns_when_db_not_initialized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("target");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a.txt"), "hello").unwrap();
+    sentinela(&tmp.path().join("db"))
+        .arg("scan")
+        .arg(&dir)
+        .assert()
+        .code(0)
+        .stderr(contains("sentinela update"));
+}
+
+/// Command with every directory the cleaner reads pointed into `base`.
+fn isolated_clean(base: &Path, temp: &Path) -> Command {
+    let mut cmd = sentinela(&base.join("db"));
+    cmd.env("TEMP", temp)
+        .env("TMP", temp)
+        .env("TMPDIR", temp)
+        .env("LOCALAPPDATA", base.join("local"))
+        .env("APPDATA", base.join("roaming"))
+        .env("ProgramData", base.join("pdata"))
+        .env("SystemRoot", base.join("windows"))
+        .env("USERPROFILE", base.join("profile"))
+        .env("HOME", base.join("profile"));
+    cmd
+}
+
+fn backdate(path: &Path) {
+    let f = fs::File::options().write(true).open(path).unwrap();
+    let two_days = std::time::Duration::from_secs(2 * 24 * 3600);
+    f.set_modified(std::time::SystemTime::now() - two_days)
+        .unwrap();
+}
+
+#[test]
+fn clean_user_temp_apply_declined_on_eof_keeps_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let temp = tmp.path().join("Temp");
+    fs::create_dir_all(&temp).unwrap();
+    let canary = temp.join("canary.tmp");
+    fs::write(&canary, "keep").unwrap();
+    backdate(&canary);
+    isolated_clean(tmp.path(), &temp)
+        .args(["clean", "--category", "user-temp", "--apply"])
+        .write_stdin("")
+        .assert()
+        .code(0);
+    assert!(canary.exists());
+}
+
+#[test]
+fn clean_apply_shows_breakdown_and_cancels_on_eof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let temp = tmp.path().join("Temp");
+    fs::create_dir_all(&temp).unwrap();
+    // crash-dumps has no age rule, so a plan exists on every platform.
+    let dumps = tmp.path().join("local/CrashDumps");
+    fs::create_dir_all(&dumps).unwrap();
+    let canary = dumps.join("a.dmp");
+    fs::write(&canary, "dump").unwrap();
+    isolated_clean(tmp.path(), &temp)
+        .args(["clean", "--category", "crash-dumps", "--apply"])
+        .write_stdin("")
+        .assert()
+        .code(0)
+        .stderr(contains("crash-dumps: 1 arquivo(s)"))
+        .stdout(contains("cancel"));
+    assert!(canary.exists());
+}

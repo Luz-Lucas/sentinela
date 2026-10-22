@@ -168,7 +168,10 @@ fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>
     } else {
         let mut builder = globset::GlobSetBuilder::new();
         for pattern in &exclude {
-            let glob = globset::Glob::new(pattern)
+            // Windows paths are case-insensitive.
+            let glob = globset::GlobBuilder::new(pattern)
+                .case_insensitive(cfg!(windows))
+                .build()
                 .with_context(|| format!("glob inválido em --exclude: {pattern}"))?;
             builder.add(glob);
         }
@@ -179,6 +182,11 @@ fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>
     let (engine, engine_warnings) = Engine::from_database(&db);
     for w in db.warnings.iter().chain(&engine_warnings) {
         eprintln!("aviso: {w}");
+    }
+    if db.manifest.is_none() {
+        eprintln!(
+            "aviso: banco de assinaturas não inicializado — rode `sentinela update` (só a assinatura de teste EICAR e as heurísticas estão ativas)"
+        );
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -244,6 +252,9 @@ fn cmd_clean(selected: Vec<String>, apply: bool, yes: bool, json: bool) -> Resul
         let files: u64 = r.categories.iter().map(|c| c.plan.files).sum();
         let bytes: u64 = r.categories.iter().map(|c| c.plan.bytes).sum();
         // Prompt goes to stderr so --json output on stdout stays valid.
+        for line in confirmation_lines(r) {
+            eprintln!("{line}");
+        }
         eprint!(
             "Apagar {files} arquivo(s), {} no total? [s/N] ",
             human_bytes(bytes)
@@ -258,6 +269,30 @@ fn cmd_clean(selected: Vec<String>, apply: bool, yes: bool, json: bool) -> Resul
     let report = clean::run_clean(&env, &cats, &selected, apply, elevated, &mut confirm);
     report::write_clean(&report, apply, json, &mut io::stdout().lock())?;
     Ok(0)
+}
+
+/// Per-category breakdown shown before the `--apply` confirmation prompt.
+fn confirmation_lines(r: &CleanReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    for c in r.categories.iter().filter(|c| c.skipped_reason.is_none()) {
+        lines.push(format!(
+            "  {}: {} arquivo(s), {}",
+            c.id,
+            c.plan.files,
+            human_bytes(c.plan.bytes)
+        ));
+        if c.id == "recycle-bin" && c.plan.files > 0 {
+            lines.push("  Lixeira será esvaziada permanentemente".to_string());
+        }
+    }
+    for c in r.categories.iter().filter(|c| c.skipped_reason.is_some()) {
+        lines.push(format!(
+            "  {}: ignorada ({})",
+            c.id,
+            c.skipped_reason.as_deref().unwrap_or_default()
+        ));
+    }
+    lines
 }
 
 fn cmd_info() -> Result<i32> {

@@ -53,10 +53,15 @@ pub struct UserTemp;
 
 impl UserTemp {
     fn resolved(env: &Env) -> (Vec<PathBuf>, Vec<String>) {
-        let temp_named = env.temp.as_ref().is_none_or(|t| {
-            t.file_name()
+        fn is_temp_name(p: &std::path::Path) -> bool {
+            p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.eq_ignore_ascii_case("temp") || n.eq_ignore_ascii_case("tmp"))
+        }
+        // Both the raw and (when it exists) the canonical name must be Temp/Tmp,
+        // so a `Temp` junction pointing at Documents is refused.
+        let temp_named = env.temp.as_ref().is_none_or(|t| {
+            is_temp_name(t) && std::fs::canonicalize(t).map_or(true, |c| is_temp_name(&c))
         });
         if !temp_named {
             let shown = env.temp.as_ref().map(|t| t.display().to_string());
