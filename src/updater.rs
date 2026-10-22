@@ -269,6 +269,9 @@ pub fn update(
     let mut summary = UpdateSummary::default();
     let now = now_rfc3339();
 
+    // 0. Never operate on a folder that is not a Sentinela database.
+    crate::signatures::ensure_replaceable(db_dir)?;
+
     // 1. Download and validate everything before touching the disk.
     let zip_bytes = fetcher
         .get(RULES_URL, &[])
@@ -473,6 +476,21 @@ mod tests {
 
     fn two_hashes() -> Resp {
         Resp::Ok(format!("# comment\n{H1}\n{H2}\n").into_bytes())
+    }
+
+    #[test]
+    fn update_refuses_non_database_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("Docs");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("canary.txt"), "keep").unwrap();
+        let f = fake(
+            two_hashes(),
+            Resp::Ok(zip_of(&[("packages/core/rules.yar", GOOD)])),
+        );
+        assert!(update(&db, &f, Some("k".into())).is_err());
+        assert_eq!(std::fs::read(db.join("canary.txt")).unwrap(), b"keep");
+        assert!(!tmp.path().join("Docs.old").exists());
     }
 
     #[test]

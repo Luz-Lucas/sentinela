@@ -82,6 +82,19 @@ fn builtin_eicar_hash() -> [u8; 32] {
 /// Loads the database from `dir`. Never fails: problems become warnings.
 /// The EICAR hash and rule are always included.
 pub fn load(dir: &Path) -> Database {
+    let old = sibling_with_suffix(dir, ".old");
+    if !dir.exists() && old.is_dir() {
+        let mut db = load_dir(&old);
+        db.warnings.push(format!(
+            "banco de assinaturas ausente; usando a cópia anterior em {} (rode `sentinela update`)",
+            old.display()
+        ));
+        return db;
+    }
+    load_dir(dir)
+}
+
+fn load_dir(dir: &Path) -> Database {
     let mut db = Database {
         hashes: HashSet::from([builtin_eicar_hash()]),
         rule_sources: vec![("builtin_eicar".to_string(), EICAR_RULE.to_string())],
@@ -144,10 +157,34 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Refuses to touch a directory that exists, is non-empty and does not look
+/// like a Sentinela database (guards against a mistaken `SENTINELA_DB_DIR`).
+pub fn ensure_replaceable(db_dir: &Path) -> anyhow::Result<()> {
+    if !db_dir.exists() {
+        return Ok(());
+    }
+    let non_empty = match std::fs::read_dir(db_dir) {
+        Ok(mut it) => it.next().is_some(),
+        Err(_) => true, // not a readable directory: be conservative
+    };
+    let is_db = ["manifest.json", "hashes.txt", "rules"]
+        .iter()
+        .any(|m| db_dir.join(m).exists());
+    if non_empty && !is_db {
+        anyhow::bail!(
+            "a pasta {} não parece um banco de assinaturas do Sentinela (sem manifest.json, hashes.txt ou rules/); \
+             recusando substituí-la. Aponte SENTINELA_DB_DIR para uma pasta vazia ou inexistente.",
+            db_dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Replaces `db_dir` with `new_dir` (rename-based). Keeps the old database as
 /// `<db_dir>.old` until the swap succeeds, restoring it if the second rename fails.
 pub fn swap_in(db_dir: &Path, new_dir: &Path) -> anyhow::Result<()> {
     use anyhow::Context;
+    ensure_replaceable(db_dir)?;
     let old_dir = sibling_with_suffix(db_dir, ".old");
     if old_dir.exists() {
         std::fs::remove_dir_all(&old_dir)
@@ -269,6 +306,7 @@ mod tests {
         let new = tmp.path().join("db.new");
         fs::create_dir_all(&db).unwrap();
         fs::write(db.join("old.txt"), "old").unwrap();
+        fs::write(db.join("hashes.txt"), "").unwrap();
         fs::create_dir_all(&new).unwrap();
         fs::write(new.join("new.txt"), "new").unwrap();
         swap_in(&db, &new).unwrap();
@@ -276,6 +314,42 @@ mod tests {
         assert!(!db.join("old.txt").exists());
         assert!(!new.exists());
         assert!(!tmp.path().join("db.old").exists());
+    }
+
+    #[test]
+    fn swap_in_refuses_foreign_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("Docs");
+        let new = tmp.path().join("Docs.new");
+        fs::create_dir_all(&db).unwrap();
+        fs::write(db.join("canary.txt"), "keep").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        assert!(swap_in(&db, &new).is_err());
+        assert!(db.join("canary.txt").exists());
+        assert!(new.exists());
+    }
+
+    #[test]
+    fn swap_in_accepts_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db");
+        let new = tmp.path().join("db.new");
+        fs::create_dir_all(&db).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("n"), "x").unwrap();
+        swap_in(&db, &new).unwrap();
+        assert!(db.join("n").exists());
+    }
+
+    #[test]
+    fn load_falls_back_to_old_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("db.old");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("hashes.txt"), format!("{H2}\n")).unwrap();
+        let db = load(&tmp.path().join("db"));
+        assert_eq!(db.hashes.len(), 2);
+        assert!(db.warnings.iter().any(|w| w.contains(".old")));
     }
 
     #[test]
