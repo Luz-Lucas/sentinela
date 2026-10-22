@@ -1,6 +1,7 @@
 //! Heuristic PE analysis. Never produces `Malicious`: only `Suspicious`.
 
 use goblin::pe::PE;
+use goblin::pe::options::{ParseMode, ParseOptions};
 use goblin::pe::section_table::{IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 
 use crate::scan::detector::{Detector, FileData, Finding, Severity};
@@ -41,7 +42,14 @@ pub struct PeReport {
 
 /// Returns `None` when `bytes` is not a parseable PE.
 pub fn analyze(bytes: &[u8]) -> Option<PeReport> {
-    let pe = PE::parse(bytes).ok()?;
+    // Permissive and header-only: a corrupted certificate/import/TLS/resource
+    // table must not blind the heuristics.
+    let opts = ParseOptions::default()
+        .with_parse_mode(ParseMode::Permissive)
+        .with_parse_imports(false)
+        .with_parse_tls_data(false)
+        .with_parse_resources(false);
+    let pe = PE::parse_with_opts(bytes, &opts).ok()?;
     let mut score = 0u32;
     let mut signals = Vec::new();
     let mut packer_hit = false;
@@ -328,6 +336,32 @@ mod tests {
         let f = inspect(&b);
         assert!(!f.is_empty());
         assert!(f.iter().all(|x| x.severity != Severity::Malicious));
+    }
+
+    #[test]
+    fn corrupt_certificate_table_does_not_hide_packer() {
+        let mut b = build_pe(&[("UPX1", WX, noise(4096))], 0x1000, true);
+        // Security directory (index 4): point far out of bounds.
+        let dd = 0x40 + 4 + 20 + 112 + 4 * 8;
+        b[dd..dd + 4].copy_from_slice(&0xFFFF_FF00u32.to_le_bytes());
+        b[dd + 4..dd + 8].copy_from_slice(&0x1000u32.to_le_bytes());
+        let f = inspect(&b);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Suspicious);
+        assert!(f[0].detail.contains("UPX"));
+    }
+
+    #[test]
+    fn extreme_section_fields_do_not_panic() {
+        let mut b = build_pe(&[(".text", WX, noise(1024))], 0x1000, false);
+        let st = 0x40 + 4 + 20 + 240;
+        b[st + 8..st + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        b[st + 12..st + 16].copy_from_slice(&(u32::MAX - 4).to_le_bytes());
+        b[st + 16..st + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+        b[st + 20..st + 24].copy_from_slice(&(u32::MAX - 10).to_le_bytes());
+        let _ = analyze(&b);
+        b[st + 20..st + 24].copy_from_slice(&0u32.to_le_bytes());
+        let _ = analyze(&b);
     }
 
     #[test]
