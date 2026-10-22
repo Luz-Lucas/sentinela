@@ -40,6 +40,9 @@ pub fn run_clean(
     elevated: bool,
     confirm: &mut dyn FnMut(&CleanReport) -> bool,
 ) -> CleanReport {
+    let mut env = env.clone();
+    env.elevated = elevated;
+    let env = &env;
     let chosen: Vec<&Box<dyn Category>> = cats
         .iter()
         .filter(|c| selected.is_empty() || selected.iter().any(|s| s == c.id()))
@@ -69,14 +72,23 @@ pub fn run_clean(
         }
     }
 
-    if apply && confirm(&report) {
-        for ((cat, result), ok) in chosen
-            .iter()
-            .zip(report.categories.iter_mut())
-            .zip(runnable)
-        {
-            if ok {
-                result.applied = Some(cat.apply(env, &result.plan));
+    let total: u64 = report.categories.iter().map(|c| c.plan.files).sum();
+    if apply && total > 0 {
+        if confirm(&report) {
+            for ((cat, result), ok) in chosen
+                .iter()
+                .zip(report.categories.iter_mut())
+                .zip(runnable)
+            {
+                if ok {
+                    result.applied = Some(cat.apply(env, &result.plan));
+                }
+            }
+        } else {
+            for (result, ok) in report.categories.iter_mut().zip(runnable) {
+                if ok {
+                    result.skipped_reason = Some("cancelado pelo usuário".to_string());
+                }
             }
         }
     }
@@ -107,6 +119,7 @@ mod tests {
             system_root: Some(sysroot),
             user_profile: Some(profile),
             now: SystemTime::now(),
+            elevated: false,
         }
     }
 
@@ -210,6 +223,7 @@ mod tests {
             files: 2,
             bytes: 8,
             warnings: vec![],
+            min_age: None,
         };
         let rep = delete_checked(&[t], &plan);
         assert_eq!(rep.deleted, 0);
@@ -311,6 +325,131 @@ mod tests {
         assert_eq!(rep.categories[0].id, "crash-dumps");
         assert!(!cd.join("a.dmp").exists());
         assert!(cd.exists());
+    }
+
+    #[test]
+    fn crash_dumps_system_roots_need_elevation() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let mini = env.system_root.clone().unwrap().join("Minidump");
+        write_aged(&mini.join("m.dmp"), b"m", two_days());
+        let p = CrashDumps.plan(&env);
+        assert_eq!(p.files, 0);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("requer administrador"))
+        );
+        let mut e = env.clone();
+        e.elevated = true;
+        assert_eq!(CrashDumps.plan(&e).files, 1);
+        // run_clean's `elevated` argument overrides the env flag.
+        let cats: Vec<Box<dyn Category>> = vec![Box::new(CrashDumps)];
+        let rep = run_clean(&e, &cats, &[], false, false, &mut |_| true);
+        assert_eq!(rep.categories[0].plan.files, 0);
+    }
+
+    #[test]
+    fn fresh_empty_dir_survives_prune() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        fs::create_dir_all(t.join("fresh_empty")).unwrap();
+        write_aged(&t.join("x/old.tmp"), b"o", two_days());
+        run_clean(&env, &user_temp(), &[], true, false, &mut |_| true);
+        assert!(t.join("fresh_empty").exists());
+        assert!(!t.join("x").exists());
+    }
+
+    #[test]
+    fn hardened_roots_and_temp_name() {
+        let d = tempfile::tempdir().unwrap();
+        let base = env_in(d.path());
+        let mut e = base.clone();
+        e.temp = e.local_app_data.clone();
+        fs::create_dir_all(e.temp.as_ref().unwrap()).unwrap();
+        let p = UserTemp.plan(&e);
+        assert!(p.warnings.len() == 1 && p.files == 0);
+        assert!(!safe_root(e.local_app_data.as_ref().unwrap(), &e));
+        let mut e = base.clone();
+        e.app_data = Some(d.path().join("roaming"));
+        assert!(!safe_root(d.path(), &e));
+        assert!(!safe_root(e.app_data.as_ref().unwrap(), &e));
+        assert!(!safe_root(e.program_data.as_ref().unwrap(), &e));
+
+        let mut e = base.clone();
+        let nt = d.path().join("some/dir/NotTemp");
+        write_aged(&nt.join("a.tmp"), b"x", two_days());
+        e.temp = Some(nt);
+        let p = UserTemp.plan(&e);
+        assert_eq!(p.files, 0);
+        assert!(!p.warnings.is_empty());
+
+        let mut e = base;
+        let ok = d.path().join("some/dir/Temp");
+        write_aged(&ok.join("a.tmp"), b"x", two_days());
+        e.temp = Some(ok);
+        assert_eq!(UserTemp.plan(&e).files, 1);
+    }
+
+    #[test]
+    fn age_rechecked_at_delete_time() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        write_aged(&t.join("a.tmp"), b"o", two_days());
+        let plan = UserTemp.plan(&env);
+        assert_eq!(plan.files, 1);
+        // The file is touched after planning.
+        write_aged(&t.join("a.tmp"), b"o", Duration::from_secs(1));
+        let rep = UserTemp.apply(&env, &plan);
+        assert_eq!(rep.deleted, 0);
+        assert_eq!(rep.skipped.len(), 1);
+        assert!(t.join("a.tmp").exists());
+    }
+
+    #[test]
+    fn confirm_not_called_when_nothing_planned() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let rep = run_clean(&env, &user_temp(), &[], true, false, &mut |_| {
+            panic!("no confirm expected")
+        });
+        assert!(rep.categories[0].applied.is_none());
+    }
+
+    #[test]
+    fn declined_marks_cancelled() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        write_aged(&env.temp.clone().unwrap().join("o.tmp"), b"o", two_days());
+        let rep = run_clean(&env, &user_temp(), &[], true, false, &mut |_| false);
+        assert_eq!(
+            rep.categories[0].skipped_reason.as_deref(),
+            Some("cancelado pelo usuário")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_escape_blocked() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        let outside = d.path().join("outside");
+        write_aged(&outside.join("secret.txt"), b"s", two_days());
+        let link = t.join("jlink");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        run_clean(&env, &user_temp(), &[], true, false, &mut |_| true);
+        assert!(outside.join("secret.txt").exists());
     }
 
     #[test]

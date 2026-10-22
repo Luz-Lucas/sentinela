@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
@@ -18,6 +18,9 @@ pub struct Env {
     pub system_root: Option<PathBuf>,
     pub user_profile: Option<PathBuf>,
     pub now: SystemTime,
+    /// Whether the process is elevated. `from_system` sets false; the CLI sets
+    /// it from its elevation check (`run_clean` also overrides it).
+    pub elevated: bool,
 }
 
 fn var_path(name: &str) -> Option<PathBuf> {
@@ -36,6 +39,7 @@ impl Env {
             system_root: var_path("SystemRoot"),
             user_profile: var_path("USERPROFILE"),
             now: SystemTime::now(),
+            elevated: false,
         }
     }
 }
@@ -52,6 +56,9 @@ pub struct Plan {
     pub files: u64,
     pub bytes: u64,
     pub warnings: Vec<String>,
+    /// If set, files modified more recently than this are skipped at delete time.
+    #[serde(skip)]
+    pub min_age: Option<Duration>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -74,8 +81,8 @@ fn normalize(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// False for drive roots, "/", the user profile, the system root, and any
-/// ancestor of the latter two.
+/// False for drive roots, "/", and any of the user profile, system root,
+/// LOCALAPPDATA, APPDATA, ProgramData or an ancestor of them.
 pub fn safe_root(p: &Path, env: &Env) -> bool {
     if p.as_os_str().is_empty() || p.parent().is_none() {
         return false;
@@ -84,7 +91,16 @@ pub fn safe_root(p: &Path, env: &Env) -> bool {
     if norm.parent().is_none() {
         return false;
     }
-    for protected in [&env.user_profile, &env.system_root].into_iter().flatten() {
+    for protected in [
+        &env.user_profile,
+        &env.system_root,
+        &env.local_app_data,
+        &env.app_data,
+        &env.program_data,
+    ]
+    .into_iter()
+    .flatten()
+    {
         let prot_norm = normalize(protected);
         // Equal to or an ancestor of a protected directory (checked on both
         // the raw and the canonical forms).
@@ -129,27 +145,51 @@ pub fn delete_checked(roots: &[PathBuf], plan: &Plan) -> ApplyReport {
         .iter()
         .filter_map(|r| fs::canonicalize(r).ok())
         .collect();
+    let mut deleted_paths = Vec::new();
 
     for cand in &plan.items {
         let path = &cand.path;
-        match delete_one(path, &canon_roots) {
-            Ok(size) => {
+        match delete_one(path, &canon_roots, plan.min_age) {
+            Ok((canon, size)) => {
                 report.deleted += 1;
                 report.freed += size;
+                deleted_paths.push(canon);
             }
             Err(reason) => report.skipped.push((path.clone(), reason)),
         }
     }
 
-    if report.deleted > 0 {
-        for root in &canon_roots {
-            prune_empty_dirs(root, true);
+    // Only ancestors of files deleted in this run are pruned, bottom-up.
+    for canon in &deleted_paths {
+        let Some(root) = canon_roots.iter().find(|r| canon.starts_with(r)) else {
+            continue;
+        };
+        let mut dir = canon.parent();
+        while let Some(d) = dir {
+            if d == root.as_path() || !d.starts_with(root) {
+                break;
+            }
+            // remove_dir fails on non-empty directories, which keeps this safe.
+            if fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
         }
     }
     report
 }
 
-fn delete_one(path: &Path, canon_roots: &[PathBuf]) -> Result<u64, String> {
+fn inside_roots(canon: &Path, canon_roots: &[PathBuf]) -> bool {
+    canon_roots
+        .iter()
+        .any(|r| canon != r.as_path() && canon.starts_with(r))
+}
+
+fn delete_one(
+    path: &Path,
+    canon_roots: &[PathBuf],
+    min_age: Option<Duration>,
+) -> Result<(PathBuf, u64), String> {
     let meta =
         fs::symlink_metadata(path).map_err(|e| format!("não foi possível ler o arquivo: {e}"))?;
     if is_link_like(&meta) {
@@ -160,39 +200,30 @@ fn delete_one(path: &Path, canon_roots: &[PathBuf]) -> Result<u64, String> {
     }
     let canon =
         fs::canonicalize(path).map_err(|e| format!("não foi possível resolver o caminho: {e}"))?;
-    if !canon_roots
-        .iter()
-        .any(|r| canon != *r && canon.starts_with(r))
-    {
+    if !inside_roots(&canon, canon_roots) {
         return Err("fora das pastas permitidas".into());
     }
-    // Re-check right before deleting to narrow the TOCTOU window.
-    match fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() && !is_link_like(&m) => {}
+    // Re-validate immediately before deleting and delete the canonical path.
+    // Residual race: handle-based deletion (FILE_FLAG_OPEN_REPARSE_POINT) is a follow-up.
+    let canon =
+        fs::canonicalize(&canon).map_err(|_| "o arquivo mudou durante a limpeza".to_string())?;
+    if !inside_roots(&canon, canon_roots) {
+        return Err("fora das pastas permitidas".into());
+    }
+    let meta = match fs::symlink_metadata(&canon) {
+        Ok(m) if m.is_file() && !is_link_like(&m) => m,
         _ => return Err("o arquivo mudou durante a limpeza".into()),
-    }
-    fs::remove_file(path).map_err(|e| format!("não foi possível apagar: {e}"))?;
-    Ok(meta.len())
-}
-
-/// Removes empty directories below `dir` bottom-up. Never follows links and
-/// never removes `dir` itself when `is_root`. Returns true if `dir` was removed.
-fn prune_empty_dirs(dir: &Path, is_root: bool) -> bool {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return false;
     };
-    let mut empty = true;
-    for entry in rd.flatten() {
-        let path = entry.path();
-        let real_dir = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir() && !is_link_like(&m));
-        if real_dir && prune_empty_dirs(&path, false) {
-            continue;
+    if let Some(min) = min_age {
+        let old_enough = meta
+            .modified()
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age > min);
+        if !old_enough {
+            return Err("arquivo modificado recentemente".into());
         }
-        empty = false;
     }
-    if empty && !is_root {
-        // remove_dir fails on non-empty directories, which keeps this safe.
-        return fs::remove_dir(dir).is_ok();
-    }
-    false
+    fs::remove_file(&canon).map_err(|e| format!("não foi possível apagar: {e}"))?;
+    Ok((canon, meta.len()))
 }

@@ -40,10 +40,11 @@ fn finish(mut plan: Plan, mut warnings: Vec<String>) -> Plan {
 
 fn plan_old(env: &Env, roots: &[PathBuf], warnings: Vec<String>) -> Plan {
     let now = env.now;
-    let plan = plan_files(roots, |e| {
+    let mut plan = plan_files(roots, |e| {
         now.duration_since(e.modified)
             .is_ok_and(|age| age > MIN_AGE)
     });
+    plan.min_age = Some(MIN_AGE);
     finish(plan, warnings)
 }
 
@@ -51,6 +52,21 @@ pub struct UserTemp;
 
 impl UserTemp {
     fn resolved(env: &Env) -> (Vec<PathBuf>, Vec<String>) {
+        let temp_named = env.temp.as_ref().is_none_or(|t| {
+            t.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("temp") || n.eq_ignore_ascii_case("tmp"))
+        });
+        if !temp_named {
+            let shown = env.temp.as_ref().map(|t| t.display().to_string());
+            return (
+                Vec::new(),
+                vec![format!(
+                    "pasta TEMP não se chama Temp/Tmp; descartada: {}",
+                    shown.unwrap_or_default()
+                )],
+            );
+        }
         resolve_roots(env, vec![("TEMP", env.temp.clone())])
     }
 }
@@ -105,28 +121,32 @@ impl Category for WindowsTemp {
 pub struct CrashDumps;
 
 impl CrashDumps {
-    /// The system-wide roots (Minidump, WER archives) are always listed; files
-    /// there that a non-admin cannot delete end up in `skipped`.
+    /// The system-wide roots (Minidump, WER archives) need elevation.
     fn resolved(env: &Env) -> (Vec<PathBuf>, Vec<String>) {
-        let wer = env
-            .program_data
-            .as_ref()
-            .map(|p| p.join("Microsoft").join("Windows").join("WER"));
-        resolve_roots(
-            env,
-            vec![
-                (
-                    "LOCALAPPDATA",
-                    env.local_app_data.as_ref().map(|p| p.join("CrashDumps")),
-                ),
-                (
-                    "SystemRoot",
-                    env.system_root.as_ref().map(|p| p.join("Minidump")),
-                ),
-                ("ProgramData", wer.as_ref().map(|p| p.join("ReportArchive"))),
-                ("ProgramData", wer.as_ref().map(|p| p.join("ReportQueue"))),
-            ],
-        )
+        let mut candidates = vec![(
+            "LOCALAPPDATA",
+            env.local_app_data.as_ref().map(|p| p.join("CrashDumps")),
+        )];
+        let mut extra = Vec::new();
+        if env.elevated {
+            let wer = env
+                .program_data
+                .as_ref()
+                .map(|p| p.join("Microsoft").join("Windows").join("WER"));
+            candidates.push((
+                "SystemRoot",
+                env.system_root.as_ref().map(|p| p.join("Minidump")),
+            ));
+            candidates.push(("ProgramData", wer.as_ref().map(|p| p.join("ReportArchive"))));
+            candidates.push(("ProgramData", wer.as_ref().map(|p| p.join("ReportQueue"))));
+        } else {
+            extra.push(
+                "Minidump e relatórios WER do sistema: requer administrador; ignorados".to_string(),
+            );
+        }
+        let (roots, mut warnings) = resolve_roots(env, candidates);
+        warnings.extend(extra);
+        (roots, warnings)
     }
 }
 
