@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -137,7 +137,36 @@ fn scan_entry(
     Ok((verdict, findings, inspect_errors))
 }
 
+/// Sink the scanner drives to report progress. `advance` is called from
+/// rayon worker threads, so implementations must be cheap and thread-safe.
+/// All methods default to no-ops.
+pub trait Progress: Sync {
+    /// Called periodically while the file list is being collected.
+    fn counting(&self, _files_seen: usize) {}
+    /// Called once the totals are known, before scanning starts.
+    fn start(&self, _total_files: usize, _total_bytes: u64) {}
+    /// Called after each file finishes (also for unreadable or hash-only
+    /// ones) with the running totals and the file just finished.
+    fn advance(&self, _files_done: usize, _bytes_done: u64, _current: &Path) {}
+    /// Called exactly once when the scan ends, including when cancelled.
+    fn finish(&self) {}
+}
+
+/// Progress sink that does nothing.
+pub struct NoProgress;
+
+impl Progress for NoProgress {}
+
 pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> ScanReport {
+    run_scan_with_progress(engine, opts, cancel, &NoProgress)
+}
+
+pub fn run_scan_with_progress(
+    engine: &Engine,
+    opts: &ScanOptions,
+    cancel: &AtomicBool,
+    progress: &dyn Progress,
+) -> ScanReport {
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     let mut skipped_in_walk = false;
@@ -147,10 +176,19 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
             break;
         }
         match item {
-            WalkItem::File(e) => entries.push(e),
+            WalkItem::File(e) => {
+                entries.push(e);
+                if entries.len().is_multiple_of(256) {
+                    progress.counting(entries.len());
+                }
+            }
             WalkItem::Error(e) => errors.push(e),
         }
     }
+    let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
+    progress.start(entries.len(), total_bytes);
+    let files_done = AtomicUsize::new(0);
+    let bytes_done = AtomicU64::new(0);
 
     let skipped = AtomicBool::new(skipped_in_walk);
     type Scanned = (Option<ScanItem>, Vec<WalkError>);
@@ -161,7 +199,7 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
                 skipped.store(true, Ordering::Relaxed);
                 return None;
             }
-            Some(
+            let scanned =
                 scan_entry(engine, entry, opts.max_size).map(|(verdict, findings, errs)| {
                     let item = (verdict >= Severity::Suspicious).then(|| ScanItem {
                         path: entry.path.clone(),
@@ -169,10 +207,15 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
                         findings,
                     });
                     (item, errs)
-                }),
-            )
+                });
+            // Errored files count too, so the bar can reach 100%.
+            let f = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+            let b = bytes_done.fetch_add(entry.size, Ordering::Relaxed) + entry.size;
+            progress.advance(f, b, &entry.path);
+            Some(scanned)
         })
         .collect();
+    progress.finish();
 
     let mut scanned = 0;
     let mut items = Vec::new();
@@ -292,6 +335,63 @@ mod tests {
         // Same file under the limit is detected.
         let report = run_scan(&engine, &opts(dir.path(), 1000), &AtomicBool::new(false));
         assert_eq!(report.items.len(), 1);
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        started: Mutex<Option<(usize, u64)>>,
+        max: Mutex<(usize, u64)>,
+        advances: std::sync::atomic::AtomicUsize,
+        finishes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Progress for Recorder {
+        fn start(&self, total_files: usize, total_bytes: u64) {
+            *self.started.lock().unwrap() = Some((total_files, total_bytes));
+        }
+        fn advance(&self, files_done: usize, bytes_done: u64, _current: &Path) {
+            self.advances.fetch_add(1, Ordering::Relaxed);
+            let mut m = self.max.lock().unwrap();
+            m.0 = m.0.max(files_done);
+            m.1 = m.1.max(bytes_done);
+        }
+        fn finish(&self) {
+            self.finishes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn progress_reports_totals_and_reaches_100_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        fs::write(dir.path().join("b.txt"), b"worlds!!").unwrap();
+        fs::write(dir.path().join("c.txt"), vec![b'z'; 100]).unwrap();
+        let (engine, _) = Engine::from_database(&marker_db());
+        let rec = Recorder::default();
+        // max_size 10 makes c.txt hash-only; its bytes must still count.
+        let report = run_scan_with_progress(
+            &engine,
+            &opts(dir.path(), 10),
+            &AtomicBool::new(false),
+            &rec,
+        );
+        assert_eq!(report.scanned, 3);
+        assert_eq!(*rec.started.lock().unwrap(), Some((3, 113)));
+        assert_eq!(rec.advances.load(Ordering::Relaxed), 3);
+        assert_eq!(*rec.max.lock().unwrap(), (3, 113));
+        assert_eq!(rec.finishes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn progress_finishes_even_when_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let (engine, _) = Engine::from_database(&marker_db());
+        let rec = Recorder::default();
+        let report =
+            run_scan_with_progress(&engine, &opts(dir.path(), 10), &AtomicBool::new(true), &rec);
+        assert!(report.interrupted);
+        assert_eq!(rec.finishes.load(Ordering::Relaxed), 1);
     }
 
     #[test]

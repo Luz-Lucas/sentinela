@@ -50,6 +50,7 @@ Não verificados:
 - `--max-size <MB>` (padrão `256`): arquivos maiores que isso só têm o hash calculado (em streaming), sem análise de conteúdo.
 - `--exclude <glob>` (repetível): ignora caminhos que casam com o glob, por exemplo `--exclude "**/node_modules/**" --exclude "**/*.iso"`.
 - Links simbólicos e junctions nunca são seguidos.
+- Barra de progresso: em um terminal, o `scan` (e a fase de verificação do `full`) mostra no stderr uma linha que se atualiza no lugar, com porcentagem (por bytes), arquivos, velocidade, ETA e o arquivo atual. Ela some ao terminar e fica oculta com `--json` ou quando o stderr é redirecionado/canalizado.
 - `Ctrl+C` interrompe a varredura e imprime o relatório parcial.
 
 ```
@@ -78,7 +79,8 @@ Um único comando, sem argumentos e **sem perguntas**:
 1. Verifica **todos os discos fixos** (`C:\`, `D:\`, …), não apenas algumas pastas. Pode levar muito tempo; rode como administrador para cobertura total. Discos removíveis, de rede e ópticos são ignorados.
 2. Move para a quarentena **somente** arquivos cujo hash é de malware conhecido (detector `hash`). Achados de YARA ou de heurísticas de PE (`[SUSPEITO]`, ou `[MALICIOSO]` vindo de YARA) podem ser falsos positivos: são **apenas relatados**, o arquivo não é tocado.
 3. Executa a limpeza de **todas** as categorias do `clean` com `--apply`, **automaticamente e sem confirmação** (as mesmas regras de segurança do `clean`: só arquivos antigos, nunca links). Se você interromper com `Ctrl+C`, a limpeza não é executada.
-4. Imprime o que foi isolado (caminho, regra, id), o que foi apenas relatado e o detalhamento da limpeza. `--json` produz o mesmo relatório em JSON.
+4. Durante a verificação mostra a mesma barra de progresso com ETA do `scan` (oculta com `--json` ou quando o stderr não é um terminal).
+5. Imprime o que foi isolado (caminho, regra, id), o que foi apenas relatado e o detalhamento da limpeza. `--json` produz o mesmo relatório em JSON.
 
 Código de saída: `0` normalmente (itens em quarentena ou suspeitos não alteram o código); `1` se malware confirmado por hash não pôde ser movido e continua no disco; `2` em erro global (por exemplo, nenhum disco encontrado). Falhas em arquivos individuais aparecem em "Não verificados".
 
