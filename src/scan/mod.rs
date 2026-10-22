@@ -192,7 +192,7 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signatures::{Database, EICAR};
+    use crate::signatures::Database;
     use std::collections::HashSet;
     use std::fs;
     use std::sync::atomic::AtomicBool;
@@ -241,6 +241,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn detects_eicar_file() {
+        use crate::signatures::EICAR;
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("eicar.com"), EICAR).unwrap();
         let db = crate::signatures::load(dir.path().join("nodb").as_path());
