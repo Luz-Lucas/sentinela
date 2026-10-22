@@ -3,7 +3,10 @@ pub mod hash;
 pub mod pe;
 pub mod yara;
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
@@ -46,7 +49,12 @@ pub struct Engine {
     hash: hash::HashDetector,
     /// Detectors that need the file contents (YARA, PE).
     content: Vec<Box<dyn Detector>>,
+    /// Serializes full reads of files above `BIG_FILE`.
+    big_read: Mutex<()>,
 }
+
+/// Files above this size are read one at a time.
+const BIG_FILE: u64 = 32 * 1024 * 1024;
 
 impl Engine {
     pub fn from_database(db: &Database) -> (Engine, Vec<String>) {
@@ -63,6 +71,7 @@ impl Engine {
         let engine = Engine {
             hash: hash::HashDetector::new(db.hashes.clone()),
             content,
+            big_read: Mutex::new(()),
         };
         (engine, warnings)
     }
@@ -83,8 +92,20 @@ fn scan_entry(
     max_size: u64,
 ) -> Result<(Severity, Vec<Finding>), WalkError> {
     let path = entry.path.as_path();
-    let mut findings = if entry.size <= max_size {
-        let bytes = std::fs::read(path).map_err(|e| walk_error(path, e))?;
+    // Big full reads are serialized to bound peak memory.
+    let _guard = (entry.size > BIG_FILE && entry.size <= max_size)
+        .then(|| engine.big_read.lock().unwrap_or_else(|p| p.into_inner()));
+    let full = if entry.size <= max_size {
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|f| f.take(max_size.saturating_add(1)).read_to_end(&mut bytes))
+            .map_err(|e| walk_error(path, e))?;
+        // Grew past the limit after the walk: fall back to hash-only.
+        (bytes.len() as u64 <= max_size).then_some(bytes)
+    } else {
+        None
+    };
+    let mut findings = if let Some(bytes) = full {
         let data = FileData {
             path,
             sha256: hash::sha256_bytes(&bytes),
@@ -103,7 +124,7 @@ fn scan_entry(
         };
         engine.hash.inspect(&data)
     };
-    findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+    findings.sort_by_key(|a| std::cmp::Reverse(a.severity));
     let verdict = findings
         .iter()
         .map(|f| f.severity)
@@ -115,8 +136,10 @@ fn scan_entry(
 pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> ScanReport {
     let mut entries = Vec::new();
     let mut errors = Vec::new();
+    let mut skipped_in_walk = false;
     for item in walk(&opts.roots, &opts.walk) {
         if cancel.load(Ordering::Relaxed) {
+            skipped_in_walk = true;
             break;
         }
         match item {
@@ -125,17 +148,23 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
         }
     }
 
+    let skipped = AtomicBool::new(skipped_in_walk);
     let results: Vec<Result<Option<ScanItem>, WalkError>> = entries
         .par_iter()
-        .filter(|_| !cancel.load(Ordering::Relaxed))
-        .map(|entry| {
-            scan_entry(engine, entry, opts.max_size).map(|(verdict, findings)| {
-                (verdict >= Severity::Suspicious).then(|| ScanItem {
-                    path: entry.path.clone(),
-                    verdict,
-                    findings,
-                })
-            })
+        .filter_map(|entry| {
+            if cancel.load(Ordering::Relaxed) {
+                skipped.store(true, Ordering::Relaxed);
+                return None;
+            }
+            Some(
+                scan_entry(engine, entry, opts.max_size).map(|(verdict, findings)| {
+                    (verdict >= Severity::Suspicious).then(|| ScanItem {
+                        path: entry.path.clone(),
+                        verdict,
+                        findings,
+                    })
+                }),
+            )
         })
         .collect();
 
@@ -156,7 +185,7 @@ pub fn run_scan(engine: &Engine, opts: &ScanOptions, cancel: &AtomicBool) -> Sca
         scanned,
         items,
         errors,
-        interrupted: cancel.load(Ordering::Relaxed),
+        interrupted: skipped.load(Ordering::Relaxed),
     }
 }
 
@@ -312,6 +341,47 @@ mod tests {
         let report = run_scan(&engine, &opts(dir.path(), 1 << 20), &AtomicBool::new(true));
         assert!(report.interrupted);
         assert_eq!(report.scanned, 0);
+    }
+
+    struct CancelOnInspect(std::sync::Arc<AtomicBool>);
+    impl Detector for CancelOnInspect {
+        fn name(&self) -> &'static str {
+            "cancel"
+        }
+        fn inspect(&self, _file: &FileData) -> Vec<Finding> {
+            self.0.store(true, Ordering::Relaxed);
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn cancel_mid_scan_sets_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("f{i}.txt")), b"hello").unwrap();
+        }
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let (mut engine, _) = Engine::from_database(&marker_db());
+        engine.content.push(Box::new(CancelOnInspect(flag.clone())));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let report = pool.install(|| run_scan(&engine, &opts(dir.path(), 1 << 20), &flag));
+        assert!(report.interrupted);
+        assert!(report.scanned >= 1 && report.scanned < 20);
+    }
+
+    #[test]
+    fn late_cancel_does_not_mark_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let (mut engine, _) = Engine::from_database(&marker_db());
+        engine.content.push(Box::new(CancelOnInspect(flag.clone())));
+        let report = run_scan(&engine, &opts(dir.path(), 1 << 20), &flag);
+        assert_eq!(report.scanned, 1);
+        assert!(!report.interrupted);
     }
 
     #[test]
