@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+hex = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 ureq = { version = "3.5.0", features = ["rustls"] }
 
 [target."cfg(windows)".dependencies]
