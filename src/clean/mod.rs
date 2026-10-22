@@ -2,3 +2,320 @@ pub mod browser;
 pub mod categories;
 pub mod category;
 pub mod platform;
+
+use serde::Serialize;
+
+use category::{ApplyReport, Category, Env, Plan};
+
+#[derive(Serialize)]
+pub struct CategoryResult {
+    pub id: String,
+    pub plan: Plan,
+    pub applied: Option<ApplyReport>,
+    pub skipped_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CleanReport {
+    pub categories: Vec<CategoryResult>,
+}
+
+/// Categories in spec order. Tasks 10/11/13 append the remaining ones.
+pub fn all_categories() -> Vec<Box<dyn Category>> {
+    vec![
+        Box::new(categories::UserTemp),
+        Box::new(categories::WindowsTemp),
+        Box::new(categories::CrashDumps),
+    ]
+}
+
+/// Plans every selected category (empty `selected` means all). Only when
+/// `apply` is set, and `confirm` approves the full report once, are files
+/// deleted. Admin categories are skipped when not `elevated`.
+pub fn run_clean(
+    env: &Env,
+    cats: &[Box<dyn Category>],
+    selected: &[String],
+    apply: bool,
+    elevated: bool,
+    confirm: &mut dyn FnMut(&CleanReport) -> bool,
+) -> CleanReport {
+    let chosen: Vec<&Box<dyn Category>> = cats
+        .iter()
+        .filter(|c| selected.is_empty() || selected.iter().any(|s| s == c.id()))
+        .collect();
+
+    let mut report = CleanReport {
+        categories: Vec::new(),
+    };
+    let mut runnable = Vec::new();
+    for cat in &chosen {
+        if cat.needs_admin() && !elevated {
+            report.categories.push(CategoryResult {
+                id: cat.id().to_string(),
+                plan: Plan::default(),
+                applied: None,
+                skipped_reason: Some("requer administrador".to_string()),
+            });
+            runnable.push(false);
+        } else {
+            report.categories.push(CategoryResult {
+                id: cat.id().to_string(),
+                plan: cat.plan(env),
+                applied: None,
+                skipped_reason: None,
+            });
+            runnable.push(true);
+        }
+    }
+
+    if apply && confirm(&report) {
+        for ((cat, result), ok) in chosen
+            .iter()
+            .zip(report.categories.iter_mut())
+            .zip(runnable)
+        {
+            if ok {
+                result.applied = Some(cat.apply(env, &result.plan));
+            }
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::categories::{CrashDumps, MIN_AGE, UserTemp, WindowsTemp};
+    use super::category::{Candidate, delete_checked, safe_root};
+    use super::*;
+    use std::fs::{self, File};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    fn env_in(base: &Path) -> Env {
+        let profile = base.join("profile");
+        let temp = base.join("temp");
+        let sysroot = base.join("windows");
+        for d in [&profile, &temp, &sysroot.join("Temp")] {
+            fs::create_dir_all(d).unwrap();
+        }
+        Env {
+            temp: Some(temp),
+            local_app_data: Some(profile.join("AppData")),
+            app_data: None,
+            program_data: Some(base.join("pdata")),
+            system_root: Some(sysroot),
+            user_profile: Some(profile),
+            now: SystemTime::now(),
+        }
+    }
+
+    fn write_aged(path: &Path, bytes: &[u8], age: Duration) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        let f = File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    fn two_days() -> Duration {
+        Duration::from_secs(2 * 24 * 3600)
+    }
+
+    fn user_temp() -> Vec<Box<dyn Category>> {
+        vec![Box::new(UserTemp)]
+    }
+
+    #[test]
+    fn plan_never_deletes() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        write_aged(&t.join("old1.tmp"), b"aaaa", two_days());
+        write_aged(&t.join("sub/old2.tmp"), b"bb", two_days());
+        write_aged(&t.join("new.tmp"), b"c", Duration::from_secs(60));
+        let rep = run_clean(&env, &user_temp(), &[], false, false, &mut |_| {
+            panic!("confirm must not be called without apply")
+        });
+        assert_eq!(rep.categories.len(), 1);
+        let plan = &rep.categories[0].plan;
+        assert_eq!(plan.files, 2);
+        assert_eq!(plan.bytes, 6);
+        assert!(rep.categories[0].applied.is_none());
+        assert!(t.join("old1.tmp").exists());
+        assert!(t.join("sub/old2.tmp").exists());
+        assert!(t.join("new.tmp").exists());
+    }
+
+    #[test]
+    fn apply_deletes_only_old_files() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        write_aged(&t.join("old.tmp"), b"old", two_days());
+        write_aged(&t.join("new.tmp"), b"new", MIN_AGE / 2);
+        let rep = run_clean(&env, &user_temp(), &[], true, false, &mut |_| true);
+        assert!(!t.join("old.tmp").exists());
+        assert!(t.join("new.tmp").exists());
+        let applied = rep.categories[0].applied.as_ref().unwrap();
+        assert_eq!(applied.deleted, 1);
+        assert_eq!(applied.freed, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_blocked() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        let outside = d.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        write_aged(&outside.join("secret.txt"), b"s", two_days());
+        std::os::unix::fs::symlink(outside.join("secret.txt"), t.join("filelink")).unwrap();
+        std::os::unix::fs::symlink(&outside, t.join("dirlink")).unwrap();
+        run_clean(&env, &user_temp(), &[], true, false, &mut |_| true);
+        assert!(outside.join("secret.txt").exists());
+        assert!(fs::symlink_metadata(t.join("dirlink")).is_ok());
+        // A forged candidate going through the directory link is refused too.
+        let plan = Plan {
+            items: vec![Candidate {
+                path: t.join("dirlink/secret.txt"),
+                size: 1,
+            }],
+            ..Plan::default()
+        };
+        let rep = delete_checked(std::slice::from_ref(&t), &plan);
+        assert_eq!(rep.deleted, 0);
+        assert_eq!(rep.skipped.len(), 1);
+        assert!(outside.join("secret.txt").exists());
+    }
+
+    #[test]
+    fn candidate_outside_roots_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        let victim = d.path().join("profile/important.doc");
+        write_aged(&victim, b"keep", two_days());
+        let plan = Plan {
+            items: vec![
+                Candidate {
+                    path: victim.clone(),
+                    size: 4,
+                },
+                Candidate {
+                    path: t.join("../profile/important.doc"),
+                    size: 4,
+                },
+            ],
+            files: 2,
+            bytes: 8,
+            warnings: vec![],
+        };
+        let rep = delete_checked(&[t], &plan);
+        assert_eq!(rep.deleted, 0);
+        assert_eq!(rep.skipped.len(), 2);
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn dangerous_temp_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let base = env_in(d.path());
+
+        let mut e = base.clone();
+        e.temp = Some(PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+        let p = UserTemp.plan(&e);
+        assert_eq!(p.files, 0);
+        assert!(!p.warnings.is_empty());
+
+        let mut e = base.clone();
+        e.temp = e.user_profile.clone();
+        write_aged(&e.temp.clone().unwrap().join("doc.txt"), b"x", two_days());
+        let p = UserTemp.plan(&e);
+        assert_eq!(p.files, 0);
+        assert!(!p.warnings.is_empty());
+
+        let mut e = base.clone();
+        e.temp = Some(d.path().to_path_buf()); // ancestor of the profile
+        let p = UserTemp.plan(&e);
+        assert_eq!(p.files, 0);
+        assert!(!p.warnings.is_empty());
+
+        let mut e = base.clone();
+        e.temp = e.system_root.clone();
+        assert_eq!(UserTemp.plan(&e).files, 0);
+
+        let mut e = base;
+        e.temp = None;
+        let p = UserTemp.plan(&e);
+        assert_eq!(p.files, 0);
+        assert!(!p.warnings.is_empty());
+        assert!(!safe_root(Path::new("/"), &e));
+    }
+
+    #[test]
+    fn admin_categories_skipped_when_not_elevated() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let wt = env.system_root.clone().unwrap().join("Temp");
+        write_aged(&wt.join("x.tmp"), b"x", two_days());
+        let cats: Vec<Box<dyn Category>> = vec![Box::new(WindowsTemp)];
+        let rep = run_clean(&env, &cats, &[], true, false, &mut |_| true);
+        assert!(rep.categories[0].skipped_reason.is_some());
+        assert!(rep.categories[0].applied.is_none());
+        assert!(wt.join("x.tmp").exists());
+        let rep = run_clean(&env, &cats, &[], true, true, &mut |_| true);
+        assert!(rep.categories[0].skipped_reason.is_none());
+        assert!(!wt.join("x.tmp").exists());
+    }
+
+    #[test]
+    fn confirm_false_aborts_apply() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        write_aged(&t.join("old.tmp"), b"old", two_days());
+        let mut calls = 0;
+        let rep = run_clean(&env, &user_temp(), &[], true, false, &mut |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(calls, 1);
+        assert!(t.join("old.tmp").exists());
+        assert!(rep.categories[0].applied.is_none());
+    }
+
+    #[test]
+    fn empty_subdirs_removed_root_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let t = env.temp.clone().unwrap();
+        write_aged(&t.join("a/b/c/old.tmp"), b"o", two_days());
+        write_aged(&t.join("a/keep/new.tmp"), b"n", Duration::from_secs(5));
+        run_clean(&env, &user_temp(), &[], true, false, &mut |_| true);
+        assert!(t.exists());
+        assert!(!t.join("a/b").exists());
+        assert!(t.join("a/keep/new.tmp").exists());
+    }
+
+    #[test]
+    fn crash_dumps_take_all_ages_and_selection_filters() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        let cd = env.local_app_data.clone().unwrap().join("CrashDumps");
+        write_aged(&cd.join("a.dmp"), b"dump", Duration::from_secs(5));
+        let cats: Vec<Box<dyn Category>> = vec![Box::new(UserTemp), Box::new(CrashDumps)];
+        let sel = vec!["crash-dumps".to_string()];
+        let rep = run_clean(&env, &cats, &sel, true, false, &mut |_| true);
+        assert_eq!(rep.categories.len(), 1);
+        assert_eq!(rep.categories[0].id, "crash-dumps");
+        assert!(!cd.join("a.dmp").exists());
+        assert!(cd.exists());
+    }
+
+    #[test]
+    fn all_categories_in_spec_order() {
+        let ids: Vec<_> = all_categories().iter().map(|c| c.id()).collect();
+        assert_eq!(ids, vec!["user-temp", "windows-temp", "crash-dumps"]);
+    }
+}
