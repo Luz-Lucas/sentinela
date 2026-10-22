@@ -8,17 +8,18 @@ use clap::{Parser, Subcommand};
 
 use crate::clean::category::Env;
 use crate::clean::{self, CleanReport, platform};
+use crate::full::{self, FullOptions};
 use crate::report::{self, human_bytes};
 use crate::scan::{Engine, ScanOptions, run_scan};
 use crate::walker::WalkOptions;
-use crate::{finder, signatures, updater};
+use crate::{finder, platform_fs, quarantine, signatures, updater};
 
 #[derive(Parser)]
 #[command(
     name = "sentinela",
     version,
     about = "Antivírus e limpador de arquivos",
-    after_help = "Códigos de saída: 0 = sucesso/nada encontrado, 1 = ameaças encontradas, 2 = erro."
+    after_help = "Códigos de saída: 0 = sucesso/nada encontrado, 1 = ameaças encontradas (em `full`: malware confirmado que não pôde ser isolado), 2 = erro."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -82,6 +83,26 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Verifica o computador inteiro, isola malware confirmado e limpa (sem perguntas)
+    Full {
+        /// Saída em JSON
+        #[arg(long)]
+        json: bool,
+        /// Só para testes: substitui os discos fixos por estas pastas
+        #[arg(long, value_name = "CAMINHO", hide = true)]
+        root: Vec<PathBuf>,
+    },
+    /// Lista os arquivos em quarentena
+    Quarantine {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restaura um arquivo da quarentena para o local original
+    Restore {
+        /// Id mostrado por `sentinela quarantine`
+        #[arg(value_name = "ID")]
+        id: String,
+    },
     /// Mostra versão, banco de assinaturas e privilégios
     Info,
 }
@@ -143,6 +164,17 @@ fn dispatch(command: Command) -> Result<i32> {
                 .context("--min-size grande demais")?;
             let (groups, errors) = finder::find_dupes(&[path], min);
             report::write_finder_dupes(&groups, &errors, json, &mut io::stdout().lock())?;
+            Ok(0)
+        }
+        Command::Full { json, root } => cmd_full(json, root),
+        Command::Quarantine { json } => {
+            let entries = quarantine::list(&quarantine::default_quarantine_dir());
+            report::write_quarantine_list(&entries, json, &mut io::stdout().lock())?;
+            Ok(0)
+        }
+        Command::Restore { id } => {
+            let path = quarantine::restore(&quarantine::default_quarantine_dir(), &id)?;
+            println!("Restaurado: {}", path.display());
             Ok(0)
         }
         Command::Info => cmd_info(),
@@ -210,6 +242,64 @@ fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>
     let scan = run_scan(&engine, &opts, &cancel);
     report::write_scan(&scan, json, &mut io::stdout().lock())?;
     Ok(scan.exit_code())
+}
+
+/// Scans every fixed drive, quarantines hash-confirmed malware (YARA/PE
+/// detections are only reported), then cleans all categories without asking.
+/// Exit code: 0 normally (quarantined or suspicious files do not change it),
+/// 1 if confirmed malware could not be quarantined and is still on disk,
+/// 2 on a global error (e.g. no drives found).
+fn cmd_full(json: bool, roots_override: Vec<PathBuf>) -> Result<i32> {
+    let roots = if roots_override.is_empty() {
+        platform_fs::fixed_drive_roots()
+    } else {
+        require_exists(&roots_override)?;
+        roots_override
+    };
+    if roots.is_empty() {
+        bail!("nenhum disco fixo encontrado");
+    }
+    // stderr keeps `--json` output on stdout valid.
+    eprintln!(
+        "Verificando: {}. Isso pode demorar bastante (todos os discos fixos).",
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let cancel = Arc::clone(&cancel);
+        if let Err(e) = ctrlc::set_handler(move || {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }) {
+            eprintln!("aviso: não foi possível registrar o Ctrl+C: {e}");
+        }
+    }
+    let elevated = platform::is_elevated();
+    let mut env = Env::from_system();
+    env.elevated = elevated;
+    let report = full::run_full(&FullOptions {
+        roots,
+        db_dir: signatures::default_db_dir(),
+        quarantine_dir: quarantine::default_quarantine_dir(),
+        env,
+        elevated,
+        max_size: 256 * 1024 * 1024,
+        cancel: &cancel,
+    });
+    for w in &report.warnings {
+        eprintln!("aviso: {w}");
+    }
+    if !report.db_initialized {
+        eprintln!(
+            "aviso: banco de assinaturas não inicializado — rode `sentinela update` (só a assinatura de teste EICAR e as heurísticas estão ativas)"
+        );
+    }
+    report::write_full(&report, json, &mut io::stdout().lock())?;
+    Ok(report.exit_code())
 }
 
 fn cmd_update() -> Result<i32> {

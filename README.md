@@ -18,6 +18,9 @@ sentinela update
 sentinela clean [--category <nome>]... [--apply] [--yes] [--json]
 sentinela find-large <caminho> [--top <N>] [--min-size <MB>] [--json]
 sentinela find-dupes <caminho> [--min-size <KB>] [--json]
+sentinela full [--json]
+sentinela quarantine [--json]
+sentinela restore <id>
 sentinela info
 ```
 
@@ -26,7 +29,7 @@ sentinela info
 | Código | Significado |
 | --- | --- |
 | `0` | Sucesso / nada encontrado |
-| `1` | Achados de malware (`scan` encontrou algo suspeito ou malicioso) |
+| `1` | Achados de malware (`scan` encontrou algo suspeito ou malicioso; no `full`, só quando malware confirmado por hash **não** pôde ser isolado) |
 | `2` | Erro global (caminho inexistente, categoria inválida, falha de rede no `update`, uso incorreto) |
 
 Erros em arquivos individuais (acesso negado, arquivo em uso) **não** interrompem a execução: aparecem em "Não verificados" no texto ou em `errors` no JSON.
@@ -52,6 +55,43 @@ Não verificados:
 ```
 sentinela scan C:\Users\eu\Downloads D:\Projetos --max-size 100 --exclude "**/*.iso" --json
 ```
+
+### `full`: verificar o computador inteiro, isolar malware e limpar
+
+```
+> sentinela full
+Verificando: C:\, D:\. Isso pode demorar bastante (todos os discos fixos).
+Verificados: 912340 | Em quarentena: 1 | Suspeitos (só relatados): 1 | Erros: 37
+
+Quarentena (malware confirmado por hash):
+  C:\Users\eu\Downloads\crack.exe — sha256:3f9a… (id 9c1e…; restaurar: sentinela restore 9c1e…)
+
+Suspeitos (apenas relatados, nenhum arquivo foi alterado):
+  [SUSPEITO] D:\Jogos\setup.exe — pe-heuristics
+
+Limpeza:
+…
+```
+
+Um único comando, sem argumentos e **sem perguntas**:
+
+1. Verifica **todos os discos fixos** (`C:\`, `D:\`, …), não apenas algumas pastas. Pode levar muito tempo; rode como administrador para cobertura total. Discos removíveis, de rede e ópticos são ignorados.
+2. Move para a quarentena **somente** arquivos cujo hash é de malware conhecido (detector `hash`). Achados de YARA ou de heurísticas de PE (`[SUSPEITO]`, ou `[MALICIOSO]` vindo de YARA) podem ser falsos positivos: são **apenas relatados**, o arquivo não é tocado.
+3. Executa a limpeza de **todas** as categorias do `clean` com `--apply`, **automaticamente e sem confirmação** (as mesmas regras de segurança do `clean`: só arquivos antigos, nunca links). Se você interromper com `Ctrl+C`, a limpeza não é executada.
+4. Imprime o que foi isolado (caminho, regra, id), o que foi apenas relatado e o detalhamento da limpeza. `--json` produz o mesmo relatório em JSON.
+
+Código de saída: `0` normalmente (itens em quarentena ou suspeitos não alteram o código); `1` se malware confirmado por hash não pôde ser movido e continua no disco; `2` em erro global (por exemplo, nenhum disco encontrado). Falhas em arquivos individuais aparecem em "Não verificados".
+
+### `quarantine` e `restore`: quarentena reversível
+
+A quarentena fica em `%LOCALAPPDATA%\Sentinela\quarantine` (altere com a variável `SENTINELA_QUARANTINE_DIR`): os arquivos isolados em `files\<id>` e o índice em `index.json`. Os arquivos são **movidos, nunca apagados**: a movimentação funciona entre discos diferentes (copia, confere o hash e só então remove o original) e, se algo falhar, o original continua no lugar. Links simbólicos e junctions nunca são seguidos.
+
+```
+sentinela quarantine [--json]   # lista id, data, tamanho, caminho original e regra
+sentinela restore <id>          # devolve o arquivo ao caminho original
+```
+
+O `restore` recusa-se a sobrescrever: se já existir algo no caminho original, ele falha (código `2`) e mantém a cópia em quarentena. Confere também o hash antes de devolver o arquivo.
 
 ### `update`: baixar assinaturas
 

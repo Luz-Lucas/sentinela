@@ -276,3 +276,124 @@ fn clean_apply_shows_breakdown_and_cancels_on_eof() {
         .stdout(contains("cancel"));
     assert!(canary.exists());
 }
+
+// ---- full / quarantine / restore ------------------------------------------
+
+/// `full` with every location it could touch redirected into `base`.
+/// `--root` is the hidden test override: tests must never scan real drives.
+fn full_cmd(base: &Path, db: &Path, root: &Path) -> Command {
+    let mut cmd = sentinela(db);
+    let home = base.join("home");
+    fs::create_dir_all(&home).unwrap();
+    cmd.env("SENTINELA_QUARANTINE_DIR", base.join("q"))
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("TEMP", home.join("temp"))
+        .env("TMP", home.join("temp"))
+        .env("LOCALAPPDATA", home.join("lad"))
+        .env("APPDATA", home.join("ad"))
+        .env("ProgramData", home.join("pd"))
+        .env("SystemRoot", home.join("win"))
+        .env("USERPROFILE", home.join("profile"));
+    cmd.arg("full").arg("--root").arg(root);
+    cmd
+}
+
+fn quarantine_cmd(base: &Path, db: &Path) -> Command {
+    let mut cmd = sentinela(db);
+    cmd.env("SENTINELA_QUARANTINE_DIR", base.join("q"));
+    cmd
+}
+
+#[test]
+fn full_quarantines_hash_hit_reports_yara_only_and_restore_reverses_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let db = marker_db(base);
+    // A rule that matches a second marker which has no hash entry.
+    let yara_marker = "SENTINELA-YARA-ONLY-MARKER-55d1";
+    fs::write(
+        db.join("rules/only.yar"),
+        format!(
+            "rule YaraOnly {{ meta: severity = \"malicious\" strings: $a = \"{yara_marker}\" condition: $a }}"
+        ),
+    )
+    .unwrap();
+    let root = base.join("drive");
+    fs::create_dir(&root).unwrap();
+    let bad = root.join("bad.bin");
+    let yara_only = root.join("yara.bin");
+    fs::write(&bad, MARKER).unwrap();
+    fs::write(&yara_only, yara_marker).unwrap();
+
+    let out = full_cmd(base, &db, &root)
+        .arg("--json")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let v = json_of(&out);
+    assert_eq!(v["version"], 1);
+    assert_eq!(v["summary"]["quarantined"], 1);
+    assert_eq!(v["summary"]["reported"], 1);
+    assert_eq!(v["quarantined"][0]["original_path"], bad.to_str().unwrap());
+    assert_eq!(v["reported"][0]["path"], yara_only.to_str().unwrap());
+    assert!(!bad.exists());
+    assert!(yara_only.exists());
+
+    let list = quarantine_cmd(base, &db)
+        .args(["quarantine", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let lv = json_of(&list);
+    let id = lv["items"][0]["id"].as_str().unwrap().to_string();
+
+    quarantine_cmd(base, &db)
+        .args(["restore", &id])
+        .assert()
+        .success()
+        .stdout(contains("bad.bin"));
+    assert_eq!(fs::read(&bad).unwrap(), MARKER.as_bytes());
+
+    // Occupied now: a second restore must fail and exit 2.
+    quarantine_cmd(base, &db)
+        .args(["restore", &id])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn full_text_output_is_portuguese_and_names_the_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let db = marker_db(base);
+    let root = base.join("drive");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("bad.bin"), MARKER).unwrap();
+    full_cmd(base, &db, &root)
+        .assert()
+        .code(0)
+        .stdout(
+            contains("Quarentena")
+                .and(contains("sha256:"))
+                .and(contains("bad.bin")),
+        )
+        .stderr(contains("banco de assinaturas não inicializado"));
+}
+
+#[test]
+fn quarantine_list_empty_and_restore_unknown_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db");
+    quarantine_cmd(tmp.path(), &db)
+        .arg("quarantine")
+        .assert()
+        .success()
+        .stdout(contains("vazia"));
+    quarantine_cmd(tmp.path(), &db)
+        .args(["restore", "nope"])
+        .assert()
+        .code(2);
+}
