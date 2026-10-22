@@ -250,11 +250,19 @@ fn cmd_scan(paths: Vec<PathBuf>, json: bool, max_size: u64, exclude: Vec<String>
 /// 1 if confirmed malware could not be quarantined and is still on disk,
 /// 2 on a global error (e.g. no drives found).
 fn cmd_full(json: bool, roots_override: Vec<PathBuf>) -> Result<i32> {
-    let roots = if roots_override.is_empty() {
-        platform_fs::fixed_drive_roots()
-    } else {
+    // The hidden `--root` test path also restricts cleaning to UserTemp:
+    // RecycleBin and WindowsUpdate act on real system state, not on `Env`.
+    let test_mode = !roots_override.is_empty();
+    let roots = if test_mode {
         require_exists(&roots_override)?;
         roots_override
+    } else {
+        platform_fs::fixed_drive_roots()
+    };
+    let categories: Vec<Box<dyn clean::category::Category>> = if test_mode {
+        vec![Box::new(clean::categories::UserTemp)]
+    } else {
+        clean::all_categories()
     };
     if roots.is_empty() {
         bail!("nenhum disco fixo encontrado");
@@ -282,6 +290,7 @@ fn cmd_full(json: bool, roots_override: Vec<PathBuf>) -> Result<i32> {
     let mut env = Env::from_system();
     env.elevated = elevated;
     let report = full::run_full(&FullOptions {
+        categories,
         roots,
         db_dir: signatures::default_db_dir(),
         quarantine_dir: quarantine::default_quarantine_dir(),

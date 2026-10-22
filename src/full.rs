@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 
-use crate::clean::category::Env;
+use crate::clean::category::{Category, Env};
 use crate::clean::{self, CleanReport};
 use crate::quarantine::{self, QuarantineEntry};
 use crate::scan::{Engine, ScanItem, ScanOptions, ScanReport, run_scan};
@@ -18,6 +18,9 @@ use crate::signatures;
 use crate::walker::{WalkError, WalkOptions};
 
 pub struct FullOptions<'a> {
+    /// Categories to clean. Production passes `clean::all_categories()`;
+    /// tests pass tempdir-only ones (RecycleBin/WindowsUpdate ignore `Env`).
+    pub categories: Vec<Box<dyn Category>>,
     pub roots: Vec<PathBuf>,
     pub db_dir: PathBuf,
     pub quarantine_dir: PathBuf,
@@ -104,6 +107,8 @@ fn parse_sha256_rule(rule: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+// Compares lossy-lowercased path strings on Windows: good enough for
+// "is this under the quarantine dir" (worst case a file is reported, not moved).
 fn is_inside(path: &Path, dir: &Path) -> bool {
     if cfg!(windows) {
         // Windows paths are case-insensitive.
@@ -144,7 +149,7 @@ pub fn run_full(opts: &FullOptions) -> FullReport {
     let clean = (!interrupted).then(|| {
         clean::run_clean(
             &opts.env,
-            &clean::all_categories(),
+            &opts.categories,
             &[],
             true,
             opts.elevated,
@@ -167,6 +172,7 @@ pub fn run_full(opts: &FullOptions) -> FullReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clean::categories::UserTemp;
     use crate::scan::detector::{Finding, Severity};
     use crate::scan::hash::sha256_bytes;
     use sha2::{Digest, Sha256};
@@ -327,6 +333,7 @@ mod tests {
 
     fn opts<'a>(w: &World, cancel: &'a AtomicBool) -> FullOptions<'a> {
         FullOptions {
+            categories: vec![Box::new(UserTemp)],
             roots: vec![w.root.clone()],
             db_dir: w.db.clone(),
             quarantine_dir: w.q.clone(),

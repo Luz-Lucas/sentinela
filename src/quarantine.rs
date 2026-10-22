@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,45 @@ fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// Cross-process lock around the index read-modify-write: `index.lock`
+/// created with `create_new`, removed on drop. A lock older than
+/// `STALE_LOCK` (crashed process) is broken.
+struct IndexLock(PathBuf);
+
+const STALE_LOCK: Duration = Duration::from_secs(60);
+
+impl IndexLock {
+    fn acquire(dir: &Path) -> Result<IndexLock> {
+        fs::create_dir_all(dir).context("não foi possível criar a pasta de quarentena")?;
+        let path = dir.join("index.lock");
+        for _ in 0..600 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(IndexLock(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > STALE_LOCK);
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+                Err(e) => return Err(e).context("não foi possível travar a quarentena"),
+            }
+        }
+        bail!("a quarentena está em uso por outro processo")
+    }
+}
+
+impl Drop for IndexLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// `Ok(None)` when the file is missing, `Err` when unreadable or malformed.
 fn read_index(dir: &Path) -> Result<Option<Vec<QuarantineEntry>>> {
     let text = match fs::read_to_string(dir.join(INDEX)) {
@@ -109,6 +148,9 @@ fn write_index(dir: &Path, entries: &[QuarantineEntry]) -> Result<()> {
     result.context("falha ao gravar o índice da quarentena")
 }
 
+/// Note: there is a small TOCTOU window between `symlink_metadata` and the
+/// later open (no `O_NOFOLLOW` without libc). Copied content is hash-verified,
+/// so the risk is low.
 /// Refuses anything that is not a plain file (symlinks, junctions, dirs).
 /// Never follows links.
 fn require_plain_file(path: &Path) -> Result<u64> {
@@ -174,6 +216,13 @@ pub fn quarantine_file(
         rule: rule.to_string(),
         quarantined_at: crate::updater::now_rfc3339(),
     };
+    let _lock = match IndexLock::acquire(dir) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = fs::remove_file(&stored);
+            return Err(e);
+        }
+    };
     let mut entries = match load_for_update(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -201,6 +250,7 @@ pub fn quarantine_file(
 /// Moves a quarantined file back to its original path. Refuses (leaving the
 /// quarantined copy alone) when something already exists there.
 pub fn restore(dir: &Path, id: &str) -> Result<PathBuf> {
+    let _lock = IndexLock::acquire(dir)?;
     let mut entries = read_index(dir)
         .map_err(|_| anyhow::anyhow!("índice da quarentena ilegível"))?
         .unwrap_or_default();
@@ -418,6 +468,27 @@ mod tests {
         assert!(restore(&f.qdir, &e.id).is_err());
         assert!(!f.src_dir.join("nowhere").exists());
         assert_eq!(list(&f.qdir).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_quarantines_keep_every_entry() {
+        let f = fx();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let q = f.qdir.clone();
+                let p = f.src_dir.join(format!("f{i}.bin"));
+                let body = format!("body-{i}");
+                fs::write(&p, &body).unwrap();
+                std::thread::spawn(move || {
+                    quarantine_file(&q, &p, sha256_bytes(body.as_bytes()), "r").unwrap()
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(list(&f.qdir).len(), 8);
+        assert!(!f.qdir.join("index.lock").exists(), "lock must be released");
     }
 
     #[test]
