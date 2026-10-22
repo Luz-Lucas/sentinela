@@ -1,5 +1,5 @@
 //! Signature updater. Downloads the YARA rule pack and (when an abuse.ch
-//! Auth-Key is available) the MalwareBazaar hash export, builds a complete new
+//! Auth-Key is available; sent in the URL path, as abuse.ch documents) the MalwareBazaar hash export, builds a complete new
 //! database in `db.new` and swaps it in atomically.
 //!
 //! Source verification (2026-10-22):
@@ -27,6 +27,22 @@ const HASHES_SOURCE: &str = "malwarebazaar-recent";
 const RULES_SOURCE: &str = "yara-forge-core";
 const MAX_DOWNLOAD: u64 = 256 * 1024 * 1024;
 const MAX_RULE_FILE: u64 = 64 * 1024 * 1024;
+const MAX_TOTAL_EXTRACTED: u64 = 256 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 1000;
+
+/// Bounds applied while decompressing the rule pack.
+#[derive(Clone, Copy)]
+struct ExtractLimits {
+    max_entries: usize,
+    max_file: u64,
+    max_total: u64,
+}
+
+const EXTRACT_LIMITS: ExtractLimits = ExtractLimits {
+    max_entries: MAX_ZIP_ENTRIES,
+    max_file: MAX_RULE_FILE,
+    max_total: MAX_TOTAL_EXTRACTED,
+};
 
 /// Returned (as the root error) by a [`Fetcher`] when the server answered
 /// 401/403, so the updater can skip that source instead of failing.
@@ -80,8 +96,11 @@ impl Fetcher for HttpFetcher {
 #[derive(Debug, Default)]
 pub struct UpdateSummary {
     pub hashes: usize,
+    /// Rule files (`.yar`) accepted / rejected; the pack may hold many rules per file.
     pub rules_ok: usize,
     pub rules_rejected: usize,
+    /// Number of individual rules compiled from the accepted files.
+    pub rules_count: usize,
     pub warnings: Vec<String>,
 }
 
@@ -141,12 +160,23 @@ fn now_rfc3339() -> String {
 }
 
 /// Extracts every `.yar`/`.yara` file of the zip as `(unique_name, source)`.
+/// Aborts if the archive has too many entries or decompresses past the total
+/// budget; a single oversized file is skipped with a warning.
 fn extract_rules(
     zip_bytes: &[u8],
     warnings: &mut Vec<String>,
+    limits: ExtractLimits,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
         .context("o pacote de regras não é um zip válido")?;
+    if archive.len() > limits.max_entries {
+        bail!(
+            "o pacote de regras tem entradas demais ({} > {}); atualização abortada",
+            archive.len(),
+            limits.max_entries
+        );
+    }
+    let mut total: u64 = 0;
     let mut sources: Vec<(String, String)> = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i).context("lendo o pacote de regras")?;
@@ -163,9 +193,23 @@ fn extract_rules(
             continue;
         }
         let mut bytes = Vec::new();
-        file.take(MAX_RULE_FILE)
+        file.take(limits.max_file + 1)
             .read_to_end(&mut bytes)
             .with_context(|| format!("lendo {entry}"))?;
+        total += bytes.len() as u64;
+        if total > limits.max_total {
+            bail!(
+                "o pacote de regras descompacta para mais de {} MiB; atualização abortada",
+                limits.max_total / (1024 * 1024)
+            );
+        }
+        if bytes.len() as u64 > limits.max_file {
+            warnings.push(format!(
+                "Regra ignorada (arquivo grande demais, acima de {} MiB): {entry}",
+                limits.max_file / (1024 * 1024)
+            ));
+            continue;
+        }
         let Ok(src) = String::from_utf8(bytes) else {
             warnings.push(format!("Regra ignorada (não é UTF-8): {entry}"));
             continue;
@@ -195,6 +239,13 @@ fn extract_rules(
     Ok(sources)
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 fn read_old_manifest(db_dir: &Path) -> Manifest {
     std::fs::read(db_dir.join("manifest.json"))
         .ok()
@@ -222,7 +273,7 @@ pub fn update(
     let zip_bytes = fetcher
         .get(RULES_URL, &[])
         .context("falha ao baixar as regras YARA")?;
-    let sources = extract_rules(&zip_bytes, &mut summary.warnings)?;
+    let sources = extract_rules(&zip_bytes, &mut summary.warnings, EXTRACT_LIMITS)?;
     if sources.is_empty() {
         bail!("o pacote de regras não contém arquivos .yar");
     }
@@ -236,8 +287,18 @@ pub fn update(
             .push(format!("Regra rejeitada ({name}): {err}"));
     }
     if summary.rules_ok == 0 {
-        bail!("nenhuma regra do pacote é válida; o banco anterior foi mantido");
+        let details: Vec<String> = outcome
+            .rejected
+            .iter()
+            .take(2)
+            .map(|(n, e)| format!("{n}: {}", truncate(e, 300)))
+            .collect();
+        bail!(
+            "nenhuma regra do pacote é válida; o banco anterior foi mantido ({})",
+            details.join(" | ")
+        );
     }
+    summary.rules_count = outcome.rules.as_ref().map_or(0, |r| r.iter().count());
 
     let mut new_hashes: Option<BTreeSet<[u8; 32]>> = None;
     match abuse_ch_key.as_deref().filter(|k| !k.trim().is_empty()) {
@@ -246,8 +307,8 @@ pub fn update(
                 .to_string(),
         ),
         Some(key) => {
-            let headers = [("Auth-Key", key.to_string())];
-            match fetcher.get(&hashes_url(Some(key)), &headers) {
+            // abuse.ch documents the key as part of the URL path (not a header).
+            match fetcher.get(&hashes_url(Some(key)), &[]) {
                 Ok(bytes) => {
                     let (set, _) = parse_hashes(&hashes_text(&bytes));
                     if set.is_empty() {
@@ -265,7 +326,14 @@ pub fn update(
                             .to_string(),
                     );
                 }
-                Err(e) => return Err(e.context("falha ao baixar os hashes")),
+                Err(e) => {
+                    // Keep the previous hashes; never leak the key into messages.
+                    let msg = format!("{e:#}").replace(key, "***");
+                    summary.warnings.push(format!(
+                        "não foi possível baixar os hashes: {}",
+                        truncate(&msg, 300)
+                    ));
+                }
             }
         }
     }
@@ -342,7 +410,7 @@ fn build_new_db(
         name: RULES_SOURCE.to_string(),
         url: RULES_URL.to_string(),
         fetched_at: now.to_string(),
-        count: summary.rules_ok,
+        count: summary.rules_count,
     });
     let manifest = Manifest {
         sources: manifest_sources,
@@ -418,6 +486,7 @@ mod tests {
         let s = update(&db, &f, Some("k".into())).unwrap();
         assert_eq!(s.hashes, 2);
         assert_eq!(s.rules_ok, 1);
+        assert_eq!(s.rules_count, 1);
         assert!(db.join("hashes.txt").is_file());
         assert_eq!(std::fs::read_dir(db.join("rules")).unwrap().count(), 1);
         let m: crate::signatures::Manifest =
@@ -489,6 +558,83 @@ mod tests {
         let s = update(&db, &f, Some("k".into())).unwrap();
         assert!(!s.warnings.is_empty());
         assert_eq!(s.rules_ok, 1);
+    }
+
+    #[test]
+    fn non_auth_hash_failure_degrades_to_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("hashes.txt"), format!("{H3}\n")).unwrap();
+        let f = fake(Resp::Fail, Resp::Ok(zip_of(&[("r.yar", GOOD)])));
+        let s = update(&db, &f, Some("k".into())).unwrap();
+        assert_eq!(s.rules_ok, 1);
+        assert_eq!(s.hashes, 1);
+        assert!(s.warnings.iter().any(|w| w.contains("baixar os hashes")));
+        assert!(
+            std::fs::read_to_string(db.join("hashes.txt"))
+                .unwrap()
+                .contains(H3)
+        );
+        assert_eq!(std::fs::read_dir(db.join("rules")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn key_never_leaks() {
+        struct Leaky;
+        impl Fetcher for Leaky {
+            fn get(&self, url: &str, _h: &[(&str, String)]) -> anyhow::Result<Vec<u8>> {
+                if url == RULES_URL {
+                    Ok(zip_of(&[("r.yar", GOOD)]))
+                } else {
+                    anyhow::bail!("falha em {url}")
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db");
+        let s = update(&db, &Leaky, Some("SEKRET-KEY-123".into())).unwrap();
+        assert!(s.warnings.iter().all(|w| !w.contains("SEKRET-KEY-123")));
+        let manifest = std::fs::read_to_string(db.join("manifest.json")).unwrap();
+        assert!(!manifest.contains("SEKRET-KEY-123"));
+    }
+
+    #[test]
+    fn all_rejected_error_includes_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("db");
+        let f = fake(two_hashes(), Resp::Ok(zip_of(&[("bad.yar", BAD)])));
+        let e = update(&db, &f, Some("k".into())).unwrap_err();
+        assert!(format!("{e:#}").contains("bad"), "{e:#}");
+        assert!(format!("{e:#}").contains("undefined_identifier"), "{e:#}");
+    }
+
+    #[test]
+    fn extraction_is_bounded() {
+        let lim = ExtractLimits {
+            max_entries: 2,
+            max_file: 100,
+            max_total: 150,
+        };
+        let mut w = Vec::new();
+        // too many entries
+        let z = zip_of(&[("a.yar", GOOD), ("b.yar", GOOD), ("c.yar", GOOD)]);
+        assert!(extract_rules(&z, &mut w, lim).is_err());
+        // total budget exceeded (2 x 90 bytes)
+        let big = "a".repeat(90);
+        let z = zip_of(&[("a.yar", &big), ("b.yar", &big)]);
+        assert!(extract_rules(&z, &mut w, lim).is_err());
+        // oversized single file is skipped with a warning, not truncated
+        let huge = "a".repeat(101);
+        let z = zip_of(&[("a.yar", &huge), ("b.yar", GOOD)]);
+        let roomy = ExtractLimits {
+            max_total: 1000,
+            ..lim
+        };
+        let got = extract_rules(&z, &mut w, roomy).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "b");
+        assert!(w.iter().any(|m| m.contains("grande demais")));
     }
 
     #[test]
